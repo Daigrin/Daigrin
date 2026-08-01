@@ -1,16 +1,29 @@
-## Hi there 👋
+# Daigrin
 
-<!--
-**Daigrin/Daigrin** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
+Daigrin is a concise, developer-focused coding assistant. It provides clear, actionable answers, prefers examples and code snippets, and asks clarifying questions when necessary.
 
-Here are some ideas to get you started:
+## Features
 
-- 🔭 I’m currently working on ...
-- 🌱 I’m currently learning ...
-- 👯 I’m looking to collaborate on ...
-- 🤔 I’m looking for help with ...
-- 💬 Ask me about ...
-- 📫 How to reach me: ...
-- 😄 Pronouns: ...
-- ⚡ Fun fact: ...
--->
+- Instruction-following assistant tuned for developer workflows
+- Opinionated, concise responses with code-first examples
+- Configurable persona and system prompt
+- Training pipeline using Hugging Face Transformers + PyTorch (LoRA/PEFT)
+- Dockerized environment for reproducible experiments
+- GitHub Actions CI for linting, tests, and a CPU smoke training job
+
+## Quickstart
+
+### Prerequisites
+
+- Python 3.10+
+- git
+- (Optional) NVIDIA GPU and CUDA drivers for full training
+- Docker (for containerized runs)
+
+### Install
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
