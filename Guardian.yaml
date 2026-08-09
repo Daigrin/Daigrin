@@ -1,0 +1,128 @@
+tasks:
+  code_generation: true
+  code_completion: true
+  code_review: true
+  debugging: true
+  testing: true
+  refactoring: true
+  documentation: true
+
+code_generation:
+  preferred_languages:
+    - Python
+    - Java
+    - C++
+  preferred_frameworks:
+    - TensorFlow
+    - PyTorch
+    - Keras
+
+code_completion:
+  max_suggestions: 5
+  min_confidence: 0.7
+
+code_review:
+  max_errors: 10
+  min_confidence: 0.8
+
+debugging:
+  max_suggestions: 5
+  min_confidence: 0.7
+  enable_memory_debugging: true
+
+testing:
+  max_test_cases: 10
+  min_confidence: 0.8
+  enable_unit_testing: true
+
+refactoring:
+  max_suggestions: 5
+  min_confidence: 0.7
+  enable_code_refactoring: true
+
+documentation:
+  max_words: 500
+  min_confidence: 0.8
+  enable_documentation_generation: true
+
+guardian_agent:
+  enabled: true
+
+  monitoring:
+    monitor_system_calls: true
+    monitor_network_connections: true
+    monitor_agent_interactions: true
+
+  threat_detection:
+    enabled: true
+    min_confidence: 0.8
+    algorithms:
+      - machine_learning
+      - signature_based
+      - anomaly_based
+      - behavioral_based
+
+  risk_assessment:
+    enabled: true
+    assess_inaction_risk: true  # agent evaluates risk of doing nothing
+    min_confidence: 0.7
+    risk_levels:
+      - low
+      - medium
+      - high
+      - critical
+    escalate_on: high  # escalate when inaction risk reaches this level
+
+  agent_termination:
+    enabled: true
+    terminate_malicious_agents: true
+    require_confirmation: true
+    auto_terminate_on_critical: true  # critical inaction risk bypasses confirmation
+
+  system_protection:
+    enabled: true
+    block_sensitive_resource_access: true
+    prevent_system_changes: true
+
+updates:
+  auto_update: true  # always check for and apply updates automatically
+  check_interval: 45m  # how often to check sources
+  verify_signatures: true  # only apply cryptographically signed updates
+  rollback_on_failure: true  # restore previous version if an update fails
+
+  sources:
+    - centralized_server
+    - cloud_services  # AWS, Azure, Google Cloud
+    - peer_to_peer_network
+    - local_sources  # local server, shared drive
+
+  protocols:
+    - https
+    - sftp
+    - ssh  # ftp removed: sends credentials in plaintext
+
+  formats:
+    - executable  # .exe
+    - script  # .ps1, .sh
+    - config  # .xml, .json
+    - database  # .sql
+
+todos:
+  - task: alert_on_high_inaction_risk
+    description: Send an alert when risk_assessment escalates at high (below the auto-terminate threshold)
+    status: pending
+  - task: test_rollback_on_failure
+    description: Verify updates.rollback_on_failure restores the previous version correctly
+    status: pending
+  - task: implement_signature_verification
+    description: Enforce updates.verify_signatures before applying any update
+    status: pending
+  - task: document_guardian_config
+    description: Keep README.md in sync with Guardian.yaml as the config evolves
+    status: pending
+  - task: quarantine_malicious_updates
+    description: Quarantine suspicious updates in an isolated area before applying them
+    status: pending
+  - task: audit_logging
+    description: Log all Guardian actions (detections, escalations, terminations, updates) to an audit trail
+    status: pending
