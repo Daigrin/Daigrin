@@ -125,4 +125,4 @@ todos:
     status: pending
   - task: audit_logging
     description: Log all Guardian actions (detections, escalations, terminations, updates) to an audit trail
-    status: pending
+    status: done  # implemented in guardian_audit.py
