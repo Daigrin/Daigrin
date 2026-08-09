@@ -22,7 +22,7 @@ def log_action(
     agent_id: Optional[str] = None,
     risk_level: Optional[str] = None,
     details: Optional[dict[str, Any]] = None,
-    log_path: Path = AUDIT_LOG_PATH,
+    log_path: Optional[Path] = None,
 ) -> dict[str, Any]:
     """Append one entry to the audit trail and return it.
 
@@ -32,7 +32,8 @@ def log_action(
         agent_id: Identifier of the agent the action concerns, if any.
         risk_level: One of RISK_LEVELS, if applicable.
         details: Arbitrary extra context (e.g. matched signature, syscall).
-        log_path: Audit trail file (JSON Lines, one entry per line).
+        log_path: Audit trail file; defaults to the module-level AUDIT_LOG_PATH,
+            read at call time so callers can redirect the trail.
 
     Raises:
         ValueError: If action_type or risk_level is not recognized.
@@ -41,6 +42,8 @@ def log_action(
         raise ValueError(f"action_type must be one of {ACTION_TYPES}")
     if risk_level is not None and risk_level not in RISK_LEVELS:
         raise ValueError(f"risk_level must be one of {RISK_LEVELS}")
+    if log_path is None:
+        log_path = AUDIT_LOG_PATH
 
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
