@@ -1,3 +1,5 @@
 guardian_audit.log
 quarantine/
 __pycache__/
+.daily-learn-request
+.daily-learn.log

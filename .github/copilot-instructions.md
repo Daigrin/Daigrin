@@ -31,3 +31,4 @@ Guardian is a **defensive-only** security supervisor for AI agent processes. Pip
 - .github/LESSONS.md is the shared cross-agent lessons log (append-only; format documented in the file).
 - Custom agents record lessons as they work and consume relevant ones before acting.
 - Run `/guardian-learn` daily to consolidate pending lessons into the agent and instruction files.
+- **Session-start check**: if `.daily-learn-request` exists and its date is today or older, remind the user that a learning cycle is due and offer to run `/guardian-learn` (then delete the marker after the cycle completes). Install the daily trigger with `scripts/install-daily-learn.sh install`.
