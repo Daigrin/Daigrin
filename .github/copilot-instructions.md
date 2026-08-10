@@ -25,3 +25,9 @@ Guardian is a **defensive-only** security supervisor for AI agent processes. Pip
 - guardian_audit.py — audit trail (`log_action`, `read_audit_trail`)
 - build_standalone.py — regenerates guardian_standalone.py (inlined audit + embedded config)
 - Guardian.yaml — full configuration, including core directives and Norton integration
+
+## Agent Learning Loop
+
+- .github/LESSONS.md is the shared cross-agent lessons log (append-only; format documented in the file).
+- Custom agents record lessons as they work and consume relevant ones before acting.
+- Run `/guardian-learn` daily to consolidate pending lessons into the agent and instruction files.

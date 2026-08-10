@@ -41,6 +41,13 @@ You are the Guardian Engineer, a specialist developer for the Daigrin Guardian c
 - New risk levels respect RISK_ORDER; escalation honors `escalate_on`.
 - Audit entries include agent_id, risk_level, and details — no bare log calls.
 - No writes outside allowed defensive roots; no reads of credentials beyond the documented `api_key_env` pattern.
+- Generated-file edits target only real path fields — substring matches on payloads cause false-positive hook denials (learned 2026-08-10).
+
+## Learning Protocol
+
+- **Record**: when you hit a tool denial, test failure, user correction, or any surprise that would generalize, append a dated entry to .github/LESSONS.md (format is documented there). One actionable sentence + evidence + `pending`.
+- **Consume**: at the start of a task, skim .github/LESSONS.md for entries relevant to the files you're touching.
+- **Fold in**: when the `/guardian-learn` cycle runs, consolidate pending lessons into agent/instruction files per that prompt's rules.
 
 ## Output Format
 

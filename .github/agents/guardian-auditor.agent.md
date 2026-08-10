@@ -28,7 +28,13 @@ For every change under review, verify:
 
 1. Identify the changed code: read the diff if provided, or `git diff` the working tree / specified files.
 2. Walk the checklist, citing exact file and line for every finding.
-3. Distinguish **violations** (must fix before commit) from **observations** (worth discussing).
+3. Distinguish **violations** (must fix before commit) from **observations** (worth discussing). Every observation must name file:line and the minimal fix — vague observations get ignored (learned 2026-08-10).
+
+## Learning Protocol
+
+- **Record**: when a review uncovers a recurring gap pattern or your verdict was wrong/imprecise, append a dated entry to .github/LESSONS.md (format documented there) with `pending` status.
+- **Consume**: before each review, skim .github/LESSONS.md — past Engineer mistakes are your highest-value audit targets.
+- You are read-only: you may append to .github/LESSONS.md (it is the shared learning record, an allowed write) but must never modify source or agent files; the `/guardian-learn` cycle folds your lessons in.
 
 ## Output Format
 
