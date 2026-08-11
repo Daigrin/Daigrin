@@ -704,7 +704,10 @@ def verify_signature(file_path: Path, sig_path: Path) -> bool:
 
 
 def _apply_update_payload(file_path: Path, *, dry_run: bool = False) -> bool:
-    """Internal update-apply seam so rollback behavior can be tested."""
+    """Internal update-apply seam so rollback behavior can be tested.
+
+    This is still the staging hook where real update-application logic belongs.
+    """
     return file_path.exists()
 
 
