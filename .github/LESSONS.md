@@ -28,3 +28,8 @@ Cross-agent learning record for this repo's custom agents (Guardian Engineer, Gu
 - **Lesson**: Review findings are only useful if actionable — every observation must name the file:line and the minimal fix, or it gets ignored.
 - **Evidence**: First audit of the customization suite; the single observation with a concrete fix (hook matching) was implemented the same session.
 - **Applied to**: .github/agents/guardian-auditor.agent.md (Output Format section).
+
+### 2026-08-11 — Guardian Engineer
+- **Lesson**: PreToolUse safety hooks should reconstruct proposals from both whole-file content fields and old/new replacement fields, then allow ambiguous payloads through instead of guessing.
+- **Evidence**: The new safety-gates hook needed to compare current Guardian files against edit payloads even though hook callers do not guarantee a single canonical content field.
+- **Applied to**: .github/hooks/scripts/guard-safety-gates.py

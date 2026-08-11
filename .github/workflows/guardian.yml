@@ -1,0 +1,36 @@
+name: Guardian
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install dependencies
+        run: python3 -m pip install --upgrade pip pytest pyyaml pillow
+      - name: Run Guardian tests
+        run: python3 -m pytest test_guardian.py test_guardian_audit.py test_guardian_tray.py -q
+
+  standalone-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Check standalone sync
+        run: |
+          if [ -f build_standalone.py ]; then
+            python3 build_standalone.py
+            git diff --exit-code guardian_standalone.py
+          else
+            echo "build_standalone.py not present; skipping standalone sync check"
+          fi

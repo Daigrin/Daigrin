@@ -1,0 +1,76 @@
+name: Daily Guardian Learn Reminder
+
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  open-learning-issue:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Open learning-cycle reminder issue when due
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = '.github/LESSONS.md';
+            const body = fs.readFileSync(path, 'utf8');
+            const today = new Date().toISOString().slice(0, 10);
+            const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+            const entries = body
+              .split(/^###\s+/m)
+              .slice(1)
+              .map((chunk) => `### ${chunk}`);
+            const due = entries.some((match) => {
+              const dateMatch = match.match(/^###\s+(\d{4}-\d{2}-\d{2})\s+—/m);
+              if (!dateMatch) {
+                return false;
+              }
+              const date = dateMatch[1];
+              const block = match;
+              return /\*\*Applied to\*\*:\s*pending\b/i.test(block) || date >= cutoff;
+            });
+            if (!due) {
+              core.info('No pending or recent lessons found; no issue created.');
+              return;
+            }
+
+            const title = `Learning cycle due — ${today}`;
+            const openIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
+            });
+            if (openIssues.some((issue) => issue.title === title)) {
+              core.info(`Issue already open: ${title}`);
+              return;
+            }
+
+            const labels = await github.paginate(github.rest.issues.listLabelsForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            });
+            const preferred = ['documentation', 'enhancement'];
+            const selected = preferred.find((name) => labels.some((label) => label.name === name));
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body: [
+                'A Guardian learning cycle is due.',
+                '',
+                `- Review [.github/LESSONS.md](https://github.com/${context.repo.owner}/${context.repo.repo}/blob/${context.sha}/.github/LESSONS.md)`,
+                '- Run `/guardian-learn` to consolidate pending or recent lessons into the agent/instruction files.',
+                '- This reminder follows the marker philosophy used by `scripts/run-daily-learn.sh`.',
+              ].join('\n'),
+              labels: selected ? [selected] : undefined,
+            });
+            core.info(`Created issue #${issue.data.number}`);

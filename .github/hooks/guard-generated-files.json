@@ -5,6 +5,11 @@
         "type": "command",
         "command": "python3 ./.github/hooks/scripts/guard-standalone.py",
         "timeout": 5
+      },
+      {
+        "type": "command",
+        "command": "python3 ./.github/hooks/scripts/guard-safety-gates.py",
+        "timeout": 5
       }
     ]
   }

@@ -703,6 +703,11 @@ def verify_signature(file_path: Path, sig_path: Path) -> bool:
     return bool(expected) and expected == sha256_of(file_path)
 
 
+def _apply_update_payload(file_path: Path, *, dry_run: bool = False) -> bool:
+    """Internal update-apply seam so rollback behavior can be tested."""
+    return file_path.exists()
+
+
 def apply_update(file_path: Path, config: Config, *, dry_run: bool = False) -> bool:
     """Verify and stage an update; quarantine + rollback hooks included."""
     upd = config.updates
@@ -721,7 +726,7 @@ def apply_update(file_path: Path, config: Config, *, dry_run: bool = False) -> b
         BACKUP_DIR.mkdir(exist_ok=True)
         backup = BACKUP_DIR / file_path.name
         backup.write_bytes(file_path.read_bytes())
-    applied_ok = file_path.exists()  # staging hook: real apply step goes here
+    applied_ok = _apply_update_payload(file_path, dry_run=dry_run)
     if not applied_ok and backup is not None:
         file_path.write_bytes(backup.read_bytes())
         log_action("update", f"Rolled back failed update {file_path.name}",

@@ -110,19 +110,19 @@ updates:
 todos:
   - task: alert_on_high_inaction_risk
     description: Send an alert when risk_assessment escalates at high (below the auto-terminate threshold)
-    status: pending
+    status: done  # run_cycle high-risk alert path now has focused coverage
   - task: test_rollback_on_failure
     description: Verify updates.rollback_on_failure restores the previous version correctly
-    status: pending
+    status: done  # backup creation, disabled path, and restore path are covered by tests
   - task: implement_signature_verification
     description: Enforce updates.verify_signatures before applying any update
-    status: pending
+    status: done  # SHA-256 signature gate rejects missing/tampered updates and accepts valid ones
   - task: document_guardian_config
     description: Keep README.md in sync with Guardian.yaml as the config evolves
-    status: pending
+    status: done  # README now documents the live Guardian config sections and CLI surface
   - task: quarantine_malicious_updates
     description: Quarantine suspicious updates in an isolated area before applying them
-    status: pending
+    status: done  # rejected updates are quarantined and the audit trail records the destination
   - task: audit_logging
     description: Log all Guardian actions (detections, escalations, terminations, updates) to an audit trail
     status: done  # implemented in guardian_audit.py
