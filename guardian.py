@@ -579,7 +579,9 @@ class NetworkConnection:
                 ["ss", "-tunap"],
                 capture_output=True, text=True, check=True, timeout=10,
             ).stdout
-        except (subprocess.SubprocessError, FileNotFoundError):
+        except (subprocess.SubprocessError, FileNotFoundError) as e:
+            log_action("detection", f"Network connection scan unavailable: {e}",
+                       details={"source": "ss -tunap"})
             return []
         return cls.parse_ss(out)
 
@@ -612,20 +614,25 @@ class NetworkConnection:
 
 
 def _split_host_port(endpoint: str) -> tuple[str, int]:
-    """Split 'host:port' (IPv4 or [v6]) into (host, port); port 0 if unknown."""
-    text = endpoint.strip().rstrip("%")
-    if text.startswith("[") and "]:" in text:  # [::1]:443
+    """Split 'host:port' (IPv4 or [v6], %-scoped) into (host, port).
+
+    Interface scopes are stripped (127.0.0.53%lo -> 127.0.0.53); port is 0
+    when unknown.
+    """
+    text = endpoint.strip()
+    if text.startswith("[") and "]:" in text:  # [::1]:443 / [fe80::1%eth0]:80
         host, _, port_s = text[1:].partition("]:")
     else:
         host, _, port_s = text.rpartition(":")
+    host = host.strip("[]").split("%", 1)[0]
     try:
-        return host.strip("[]"), int(port_s)
+        return host, int(port_s)
     except ValueError:
-        return host.strip("[]"), 0
+        return host, 0
 
 
 def _is_loopback_host(host: str) -> bool:
-    """True for loopback/wildcard bind addresses (127.0.0.1, ::1, 0.0.0.0, *).
+    """True for loopback/wildcard bind addresses (127.0.0.1, ::1, *).
 
     Loopback listeners serve local processes, not remote attackers, so they
     are weak intrusion signals; wildcard binds (0.0.0.0) accept remote
@@ -683,7 +690,9 @@ def _scan_all_processes() -> list[AgentProcess]:
             ["ps", "-eo", "pid=,ppid=,user=,comm=,args="],
             capture_output=True, text=True, check=True, timeout=10,
         ).stdout
-    except (subprocess.SubprocessError, FileNotFoundError):
+    except (subprocess.SubprocessError, FileNotFoundError) as e:
+        log_action("detection", f"Process table scan unavailable: {e}",
+                   details={"source": "ps -eo"})
         return []
     procs = []
     for line in out.splitlines()[1:]:
@@ -761,11 +770,16 @@ def _detect_surveillance(ids: dict[str, Any], procs: list[AgentProcess]) -> list
     findings = []
     tools = [str(t).lower() for t in ids.get("surveillance_tools", [])]
     for proc in procs:
-        name = proc.name.lower()
         if any(excluded in proc.cmdline.lower() for excluded in SURVEILLANCE_EXCLUDED):
             continue  # never flag the defender or the login session
+        # Match the invoked program (argv[0] basename) or comm, not free
+        # substrings: "vim tcpdump-notes.txt" must not be flagged.
+        try:
+            argv0 = Path(shlex.split(proc.cmdline)[0]).name.lower()
+        except (ValueError, IndexError):
+            argv0 = ""
         for tool in tools:
-            if tool and (tool in name or tool in proc.cmdline.lower()):
+            if tool and tool in (proc.name.lower(), argv0):
                 det = Detection("intrusion_detection",
                                 f"Surveillance tool running: {proc.name} (pid={proc.pid}) "
                                 f"may be watching or recording this machine",
@@ -786,6 +800,17 @@ def assess_intrusion_risk(intr: Intrusion, config: Config) -> str:
     return intr.detection.base_risk
 
 
+def _proc_ppid(pid: int) -> int:
+    """Read a process's parent PID from /proc (0 if unreadable)."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        # Field 4 is ppid; the comm (field 2) may contain spaces/parens, so
+        # anchor after the last ')'.
+        return int(stat[stat.rindex(")") + 1:].split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
 def trace_intrusion_origin(intr: Intrusion) -> dict[str, Any]:
     """Find where the intrusion came from: remote endpoint + owning process.
 
@@ -801,7 +826,7 @@ def trace_intrusion_origin(intr: Intrusion) -> dict[str, Any]:
         origin["local"] = intr.conn.local
     if intr.pid > 0:
         proc = AgentProcess(pid=intr.pid, name=intr.process,
-                            cmdline=intr.process, ppid=0)
+                            cmdline=intr.process, ppid=_proc_ppid(intr.pid))
         prov = trace_provenance(proc)
         origin["exe"] = prov.get("exe", "")
         origin["cwd"] = prov.get("cwd", "")
@@ -875,6 +900,12 @@ def stop_intrusion(intr: Intrusion, risk: str, config: Config, *,
     policy = safety or SafetyPolicy(config)
     if not policy.authorize_intrusion_stop(intr, detection=intr.detection, risk=risk):
         return False
+    if intr.pid <= 0:
+        log_action("termination",
+                   f"Cannot stop intrusion {intr.kind}: no owning process to stop",
+                   agent_id=str(intr.pid), risk_level=risk,
+                   details={"kind": intr.kind})
+        return False
     ids = config.section("intrusion_detection")
     needs_confirm = ids.get("require_confirmation", True)
     if ids.get("auto_stop_on_critical") and risk == "critical":
@@ -886,12 +917,6 @@ def stop_intrusion(intr: Intrusion, risk: str, config: Config, *,
             log_action("termination", f"Intrusion stop declined for PID {intr.pid}",
                        agent_id=str(intr.pid), risk_level=risk)
             return False
-    if intr.pid <= 0:
-        log_action("termination",
-                   f"Cannot stop intrusion {intr.kind}: no owning process to stop",
-                   agent_id=str(intr.pid), risk_level=risk,
-                   details={"kind": intr.kind})
-        return False
     if dry_run:
         return True
     try:

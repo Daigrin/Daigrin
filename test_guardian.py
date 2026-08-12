@@ -583,6 +583,14 @@ class TestNetworkConnectionParsing(unittest.TestCase):
         self.assertEqual((conns[2].local, conns[2].remote),
                          ("127.0.0.53%lo:53", "0.0.0.0:*"))
 
+    def test_split_host_port_strips_interface_scope(self):
+        from guardian import _split_host_port, _is_loopback_host
+        host, port = _split_host_port("127.0.0.53%lo:53")
+        self.assertEqual((host, port), ("127.0.0.53", 53))
+        self.assertTrue(_is_loopback_host(host))  # systemd-resolved is loopback
+        host, port = _split_host_port("[fe80::1%eth0]:8080")
+        self.assertEqual((host, port), ("fe80::1", 8080))
+
     def test_parse_ss_skips_malformed_lines(self):
         self.assertEqual(NetworkConnection.parse_ss("header\ntoo short\n"), [])
 
@@ -605,6 +613,13 @@ class TestDetectIntrusions(unittest.TestCase):
         backdoors and must not be flagged (restraint: fewest false stops)."""
         findings = detect_intrusions(make_intrusion_config(),
                                      conns=[CONN_LOOPBACK], procs=[])
+        self.assertEqual(findings, [])
+
+    def test_scoped_loopback_listener_not_flagged(self):
+        """systemd-resolved style 127.0.0.53%lo:53 must never be flagged."""
+        scoped = NetworkConnection("LISTEN", "127.0.0.53%lo:53", "0.0.0.0:*", "", 0)
+        findings = detect_intrusions(make_intrusion_config(),
+                                     conns=[scoped], procs=[])
         self.assertEqual(findings, [])
 
     def test_wildcard_listener_with_only_loopback_peers_not_flagged(self):
@@ -649,6 +664,13 @@ class TestDetectIntrusions(unittest.TestCase):
         findings = detect_intrusions(cfg, conns=[], procs=[PROC_GUARDIANISH])
         self.assertEqual(findings, [])
 
+    def test_tool_name_in_argument_not_flagged(self):
+        """'vim tcpdump-notes.txt' merely mentions a tool; matching is on the
+        invoked program (argv[0]) and comm only (restraint)."""
+        mention = AgentProcess(pid=9300, name="vim", cmdline="vim tcpdump-notes.txt")
+        findings = detect_intrusions(make_intrusion_config(), conns=[], procs=[mention])
+        self.assertEqual(findings, [])
+
     def test_disabled_section_is_noop(self):
         cfg = make_intrusion_config(enabled=False)
         findings = detect_intrusions(cfg, conns=[CONN_BACKDOOR], procs=[PROC_SPY])
@@ -676,27 +698,35 @@ class TestIntrusionRisk(unittest.TestCase):
 
 
 class TestTraceIntrusionOrigin(unittest.TestCase):
-    def test_origin_includes_remote_endpoint_and_provenance(self):
+    def test_origin_includes_remote_endpoint_and_real_provenance(self):
+        """Patch at the /proc + ps boundaries so the real ppid wiring and the
+        ancestor walk are exercised (not mocked away)."""
         intr = Intrusion("reverse_shell", CONN_REVERSE,
                          Detection("intrusion_detection", "desc", "m", "critical"),
                          "bash", 777)
-        prov = {"exe": "/bin/bash", "cwd": "/tmp",
-                "ancestors": [{"pid": 100, "name": "sshd", "cmdline": "sshd"}]}
-        with patch("guardian.trace_provenance", return_value=prov):
+        stat = "777 (bash) S 100 777 777 0 -1 4194304 100 0 0 0 0 0 0 0"
+        with patch("guardian.Path.read_text", return_value=stat), \
+             patch("guardian.os.readlink", side_effect=OSError("gone")), \
+             patch("guardian.subprocess.run") as run:
+            run.return_value = type("R", (), {"stdout": "1 sshd 'sshd: session'\n"})()
             origin = trace_intrusion_origin(intr)
         self.assertEqual(origin["remote_host"], "203.0.113.9")
         self.assertEqual(origin["remote_port"], 4444)
-        self.assertEqual(origin["ancestors"][0]["name"], "sshd")
+        self.assertEqual(origin["ancestors"],
+                         [{"pid": 100, "name": "sshd", "cmdline": "sshd: session"}])
 
     def test_surveillance_origin_has_no_remote(self):
         intr = Intrusion("surveillance", None,
                          Detection("intrusion_detection", "desc", "m", "high"),
                          "tcpdump", 9100)
-        prov = {"exe": "/usr/bin/tcpdump", "cwd": "/", "ancestors": []}
-        with patch("guardian.trace_provenance", return_value=prov):
+        stat = "9100 (tcpdump) S 1 9100 9100 0 -1 4194304 100 0 0 0 0 0 0 0"
+        with patch("guardian.Path.read_text", return_value=stat), \
+             patch("guardian.os.readlink", side_effect=OSError("gone")), \
+             patch("guardian.subprocess.run") as run:
             origin = trace_intrusion_origin(intr)
         self.assertNotIn("remote_host", origin)
-        self.assertEqual(origin["exe"], "/usr/bin/tcpdump")
+        self.assertEqual(origin["ancestors"], [])  # ppid 1: nothing to walk
+        run.assert_not_called()
 
 
 class TestQuarantineIntrusion(unittest.TestCase):
@@ -801,10 +831,24 @@ class TestStopIntrusion(unittest.TestCase):
             self.assertEqual(len(declines), 1)
 
     def test_no_pid_is_not_stopped_but_audited(self):
-        with patch("guardian.proc_kill") as kill:
-            self.assertFalse(stop_intrusion(self.make_intr(pid=0), "critical",
-                                            make_intrusion_config()))
-            kill.assert_not_called()
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "audit.log"
+            with patch.object(guardian_audit, "AUDIT_LOG_PATH", log), \
+                 patch("guardian.proc_kill") as kill:
+                self.assertFalse(stop_intrusion(self.make_intr(pid=0), "critical",
+                                                make_intrusion_config()))
+                kill.assert_not_called()
+            entries = [e for e in read_audit_trail(log, action_type="termination")
+                       if "no owning process" in e["description"]]
+            self.assertEqual(len(entries), 1)
+
+    def test_high_requires_confirmation_accepted(self):
+        """Confirmation path: operator approval stops the intrusion process."""
+        with patch("builtins.input", return_value="y"), \
+             patch("guardian.proc_kill") as kill:
+            self.assertTrue(stop_intrusion(self.make_intr(risk="high"), "high",
+                                           make_intrusion_config()))
+            kill.assert_called_once_with(777)
 
     def test_refusal_path_self_harm_blocked(self):
         """Refusal path: the guardian never stops its own processes, even when
