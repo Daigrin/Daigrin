@@ -301,15 +301,19 @@ class TestCheckUpdates(unittest.TestCase):
         self.drop_update("a.sh")
         cfg = make_config()
         cfg.raw["updates"]["auto_update"] = False
-        self.assertEqual(check_updates(cfg), 0)
+        log = self.dir / "audit.log"
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", log):
+            self.assertEqual(check_updates(cfg), 0)
         self.assertTrue((self.inbox / "a.sh").exists())  # untouched
-        actions = [a["description"] for a in read_audit_trail(action_type="update")]
+        actions = [a["description"] for a in read_audit_trail(log, action_type="update")]
         self.assertTrue(any("auto_update is false" in a for a in actions))
 
     def test_update_sweep_is_audited(self):
         self.drop_update("a.sh")
-        check_updates(make_config())
-        actions = [a["description"] for a in read_audit_trail(action_type="update")]
+        log = self.dir / "audit.log"
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", log):
+            check_updates(make_config())
+        actions = [a["description"] for a in read_audit_trail(log, action_type="update")]
         self.assertTrue(any("Applied update a.sh" in a for a in actions))
         self.assertTrue(any("Update check complete: 1/1 applied" in a for a in actions))
 

@@ -885,7 +885,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     update_interval = parse_interval(config.updates.get("check_interval"), default=2700.0)
-    last_update_check = time.monotonic()
+    last_update_check = 0.0  # fire the first sweep at the start of the first iteration
     print(f"Guardian running: scanning every {args.interval}s for {args.pattern!r} processes. Ctrl-C to stop.")
     try:
         while True:
