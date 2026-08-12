@@ -666,7 +666,6 @@ def terminate_agent(proc: AgentProcess, risk: str, config: Config, *, dry_run: b
 
 def proc_kill(pid: int) -> None:
     """Send SIGKILL to a process (isolated for testability)."""
-    import os
     os.kill(pid, signal.SIGKILL)
 
 
