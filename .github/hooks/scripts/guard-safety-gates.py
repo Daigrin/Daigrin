@@ -49,18 +49,55 @@ def target_path(data):
 
 
 
+def iter_replacements(data):
+    """Yield (old, new) pairs from every recognized edit field, in order."""
+    pairs = []
+    for old_field in OLD_FIELDS:
+        old_value = data.get(old_field)
+        if isinstance(old_value, str):
+            new_value = next(
+                (data.get(field) for field in NEW_FIELDS if isinstance(data.get(field), str)),
+                None,
+            )
+            if new_value is not None:
+                pairs.append((old_value, new_value))
+    edits = data.get("edits")
+    if isinstance(edits, list):
+        for edit in edits:
+            if isinstance(edit, dict):
+                old_value = next((edit.get(field) for field in OLD_FIELDS if isinstance(edit.get(field), str)), None)
+                new_value = next((edit.get(field) for field in NEW_FIELDS if isinstance(edit.get(field), str)), None)
+                if old_value is not None and new_value is not None:
+                    pairs.append((old_value, new_value))
+    return pairs
+
+
+
 def proposed_content(data, current: str):
+    """Reconstruct the post-edit file, or None if the proposal is ambiguous.
+
+    Whole-file content fields take precedence (they describe the final state
+    directly). Otherwise apply every recognized old/new replacement in order.
+    """
     for field in CONTENT_FIELDS:
         value = data.get(field)
         if isinstance(value, str):
             return value
-    old_value = next((data.get(field) for field in OLD_FIELDS if isinstance(data.get(field), str)), None)
-    new_value = next((data.get(field) for field in NEW_FIELDS if isinstance(data.get(field), str)), None)
-    if old_value is None or new_value is None:
-        return None
-    if old_value not in current:
-        return None
-    return current.replace(old_value, new_value, 1)
+
+    proposed = current
+    applied_any = False
+    for old_value, new_value in iter_replacements(data):
+        if old_value not in proposed:
+            return None
+        proposed = proposed.replace(old_value, new_value, 1)
+        applied_any = True
+    return proposed if applied_any else None
+
+
+
+def log_action_calls(text: str) -> int:
+    """Count call-like occurrences of log_action, tolerant of one space before '('."""
+    return text.count("log_action(") + text.count("log_action (")
 
 
 
@@ -83,8 +120,8 @@ def main():
         allow()
         return
 
-    current_logs = current.count("log_action(")
-    proposed_logs = proposed.count("log_action(")
+    current_logs = log_action_calls(current)
+    proposed_logs = log_action_calls(proposed)
     if proposed_logs < current_logs:
         deny(f"Refusing to remove Guardian audit coverage from {path.name}: log_action() count would drop from {current_logs} to {proposed_logs}.")
         return

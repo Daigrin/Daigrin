@@ -20,7 +20,7 @@ jobs:
       - name: Install dependencies
         run: python3 -m pip install --upgrade pip pytest pyyaml pillow
       - name: Run Guardian tests
-        run: python3 -m pytest test_guardian.py test_guardian_audit.py test_guardian_tray.py -q
+        run: python3 -m pytest test_guardian.py test_guardian_audit.py test_guardian_tray.py test_hooks.py -q
 
   standalone-sync:
     runs-on: ubuntu-latest

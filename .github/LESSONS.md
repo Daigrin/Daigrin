@@ -33,3 +33,8 @@ Cross-agent learning record for this repo's custom agents (Guardian Engineer, Gu
 - **Lesson**: PreToolUse safety hooks should reconstruct proposals from both whole-file content fields and old/new replacement fields, then allow ambiguous payloads through instead of guessing.
 - **Evidence**: The new safety-gates hook needed to compare current Guardian files against edit payloads even though hook callers do not guarantee a single canonical content field.
 - **Applied to**: .github/hooks/scripts/guard-safety-gates.py
+
+### 2026-08-12 — Guardian Engineer
+- **Lesson**: Count-based safety hooks must reconstruct the full post-edit file across every recognized edit field; applying only the first replacement is a silent multi-edit bypass.
+- **Evidence**: Review of the safety-gates hook found that an innocent first edit plus a later malicious edit could remove `log_action()` coverage without changing the reconstructed proposal seen by the guard.
+- **Applied to**: .github/hooks/scripts/guard-safety-gates.py, test_hooks.py, .github/workflows/guardian.yml
