@@ -18,9 +18,11 @@ from guardian import (
     load_signatures,
     ml_scan,
     parse_interval,
+    quarantine_threat,
     run_cycle,
     signature_scan,
     terminate_agent,
+    trace_provenance,
     verify_signature,
     sha256_of,
 )
@@ -227,6 +229,25 @@ class TestUpdates(unittest.TestCase):
         self.assertFalse(f.exists())
         self.assertTrue((self.dir / "quarantine" / "update.sh").exists())
 
+    def test_quarantined_update_reports_evidence_and_origin(self):
+        """A rejected update is quarantined with a sha256 evidence hash, its
+        origin (the inbox path) reported in the audit trail and via alert."""
+        import guardian as g
+        f = self.make_update(sign=False)
+        log = self.dir / "audit.log"
+        alerts = []
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", log), \
+             patch.object(g, "send_alert", lambda msg, **kw: alerts.append((msg, kw))):
+            self.assertFalse(apply_update(f, make_config()))
+        entries = read_audit_trail(log, action_type="update")
+        rejected = [e for e in entries if "quarantined" in e["description"]]
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["details"]["sha256"],
+                         sha256_of(Path(self.dir / "quarantine" / "update.sh")))
+        self.assertEqual(rejected[0]["details"]["source"], str(f))
+        self.assertEqual(len(alerts), 1)  # report sent
+        self.assertIn("origin", alerts[0][0])
+
     def test_signed_update_applied(self):
         f = self.make_update()
         self.assertTrue(apply_update(f, make_config()))
@@ -352,6 +373,130 @@ class TestSignaturesDB(unittest.TestCase):
         self.assertIn("rm -rf /", sigs)
 
 
+class TestTraceProvenance(unittest.TestCase):
+    def test_walks_ancestor_chain_to_origin(self):
+        """Provenance traces the exact parent chain to where the threat came from."""
+        with patch("guardian.os.readlink", side_effect=OSError("gone")), \
+             patch("guardian.subprocess.run") as run:
+            run.return_value = type("R", (), {"stdout": "1001 sshd 'sshd: session'\n1 init /sbin/init\n"})()
+            prov = trace_provenance(AgentProcess(4321, "agent", "agent evil", ppid=1001))
+        self.assertEqual(prov["ppid"], 1001)
+        self.assertEqual(prov["ancestors"],
+                         [{"pid": 1001, "name": "sshd", "cmdline": "sshd: session"}])
+        run.assert_called_once()
+
+    def test_parent_gone_stops_walk(self):
+        with patch("guardian.os.readlink", side_effect=OSError("gone")), \
+             patch("guardian.subprocess.run") as run:
+            run.return_value = type("R", (), {"stdout": ""})()
+            prov = trace_provenance(AgentProcess(4321, "agent", "agent evil", ppid=9999))
+        self.assertEqual(prov["ancestors"], [])
+        self.assertEqual(prov["exe"], "")
+        self.assertEqual(prov["cwd"], "")
+
+    def test_init_parent_means_no_ancestors(self):
+        with patch("guardian.os.readlink", side_effect=OSError("gone")), \
+             patch("guardian.subprocess.run") as run:
+            prov = trace_provenance(AgentProcess(4321, "agent", "agent evil", ppid=1))
+        self.assertEqual(prov["ancestors"], [])
+        run.assert_not_called()
+
+
+class TestQuarantineThreat(unittest.TestCase):
+    def setUp(self):
+        import os
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.old_cwd = os.getcwd()
+        os.chdir(self.dir)
+        self.log = self.dir / "audit.log"
+
+    def tearDown(self):
+        import os
+        os.chdir(self.old_cwd)
+        self.tmp.cleanup()
+
+    def test_quarantines_exe_and_evidence_with_provenance(self):
+        """Allowed path: the threat binary and an evidence record (including the
+        traced origin) land in quarantine/, audited, and reported via alert."""
+        exe = self.dir / "evil.bin"
+        exe.write_bytes(b"malicious")
+        proc = AgentProcess(4321, "agent", "agent evil", ppid=1)
+        prov = {"exe": str(exe), "cwd": str(self.dir),
+                "ancestors": [{"pid": 100, "name": "sshd", "cmdline": "sshd"}]}
+        alerts = []
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", self.log), \
+             patch("guardian.trace_provenance", return_value=prov), \
+             patch("guardian.send_alert", lambda msg, **kw: alerts.append((msg, kw))):
+            target = quarantine_threat(proc, DETECTION_HIGH, "high", make_config())
+        self.assertEqual(target, Path("quarantine") / "pid4321-evil.bin")
+        self.assertEqual(Path(target).read_bytes(), b"malicious")
+        record = self.dir / "quarantine" / "threat_pid4321.json"
+        evidence = json.loads(record.read_text())
+        self.assertEqual(evidence["threat_sha256"], sha256_of(exe))
+        self.assertEqual(evidence["provenance"]["ancestors"][0]["name"], "sshd")
+        self.assertEqual(evidence["process"]["pid"], 4321)
+        entries = read_audit_trail(self.log, action_type="protection")
+        self.assertTrue(any("Quarantined threat" in e["description"] for e in entries))
+        self.assertIn("pid=100 (sshd)", entries[-1]["description"])  # origin reported
+        self.assertEqual(len(alerts), 1)  # report sent
+        self.assertIn("origin", alerts[0][1])
+
+    def test_quarantines_evidence_record_when_no_exe(self):
+        """No on-disk binary: the cmdline/provenance record is still quarantined."""
+        proc = AgentProcess(4321, "agent", "agent evil", ppid=1)
+        prov = {"exe": "", "cwd": "", "ancestors": []}
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", self.log), \
+             patch("guardian.trace_provenance", return_value=prov), \
+             patch("guardian.send_alert"):
+            target = quarantine_threat(proc, DETECTION_HIGH, "high", make_config())
+        self.assertIsNone(target)
+        self.assertTrue((self.dir / "quarantine" / "threat_pid4321.json").exists())
+        descs = [e["description"] for e in read_audit_trail(self.log, action_type="protection")]
+        self.assertTrue(any("origin unknown" in d for d in descs))
+
+    def test_refusal_path_write_denied_is_audited(self):
+        """Refusal path: when SafetyPolicy denies the quarantine write, nothing is
+        written and the SAFETY REFUSAL hits the audit trail."""
+        import guardian as g
+        exe = self.dir / "evil.bin"
+        exe.write_bytes(b"malicious")
+        proc = AgentProcess(4321, "agent", "agent evil", ppid=1)
+        prov = {"exe": str(exe), "cwd": str(self.dir), "ancestors": []}
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", self.log), \
+             patch("guardian.trace_provenance", return_value=prov), \
+             patch.object(g.SafetyPolicy, "authorize_write",
+                          lambda self_, p: g.SafetyPolicy._refuse(
+                              self_, "write", "test denies quarantine write", path=str(p))), \
+             patch("guardian.send_alert"):
+            target = quarantine_threat(proc, DETECTION_HIGH, "high", make_config())
+        self.assertIsNone(target)
+        self.assertFalse((self.dir / "quarantine" / "pid4321-evil.bin").exists())
+        refusals = [e for e in read_audit_trail(self.log, action_type="protection")
+                    if "SAFETY REFUSAL" in e["description"]]
+        # Both the exe copy and the evidence-record write are refused + audited.
+        self.assertEqual(len(refusals), 2)
+
+    def test_disabled_config_is_noop(self):
+        cfg = make_config(threat_quarantine={"enabled": False})
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", self.log):
+            self.assertIsNone(quarantine_threat(PROC_EVIL, DETECTION_HIGH, "high", cfg))
+        self.assertFalse((self.dir / "quarantine").exists())
+        self.assertEqual(read_audit_trail(self.log), [])
+
+    def test_dry_run_quarantines_nothing_but_audits(self):
+        proc = AgentProcess(4321, "agent", "agent evil", ppid=1)
+        prov = {"exe": "", "cwd": "", "ancestors": []}
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", self.log), \
+             patch("guardian.trace_provenance", return_value=prov), \
+             patch("guardian.send_alert"):
+            self.assertIsNone(
+                quarantine_threat(proc, DETECTION_HIGH, "high", make_config(), dry_run=True))
+        self.assertFalse((self.dir / "quarantine").exists())
+        descs = [e["description"] for e in read_audit_trail(self.log, action_type="protection")]
+        self.assertTrue(any("DRY RUN: would quarantine" in d for d in descs))
+
+
 class TestRunCycle(unittest.TestCase):
     def test_cycle_detects_escalates_and_logs(self):
         with tempfile.TemporaryDirectory() as d:
@@ -371,6 +516,22 @@ class TestRunCycle(unittest.TestCase):
             with patch("guardian.AgentProcess.scan", return_value=[PROC_SAFE]):
                 acted = run_cycle(make_config(), ["rm -rf /"], dry_run=True, audit_log=log)
             self.assertEqual(acted, 0)
+
+    def test_cycle_quarantines_and_reports_every_detection(self):
+        """Every detected threat is quarantined and reported, even when the risk
+        is below the escalation threshold (no termination, still quarantined)."""
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "audit.log"
+            prov = {"exe": "", "cwd": "", "ancestors": []}
+            with patch("guardian.AgentProcess.scan", return_value=[PROC_EVIL]), \
+                 patch("guardian.quarantine_threat", wraps=quarantine_threat) as qt, \
+                 patch("guardian.trace_provenance", return_value=prov), \
+                 patch("guardian.send_alert"), \
+                 patch("guardian.proc_kill"):
+                run_cycle(make_config(), ["curl"], dry_run=True, audit_log=log)
+            self.assertGreaterEqual(qt.call_count, 1)
+            descs = [e["description"] for e in read_audit_trail(log, action_type="protection")]
+            self.assertTrue(any("quarantine threat" in d for d in descs))
 
 
 if __name__ == "__main__":

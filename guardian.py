@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -194,29 +195,39 @@ class AgentProcess:
     pid: int
     name: str
     cmdline: str
+    ppid: int = 0
+    user: str = ""
+    exe: str = ""
+    cwd: str = ""
 
     @classmethod
     def scan(cls, pattern: str = "agent") -> list["AgentProcess"]:
         """Find running processes whose command line matches a pattern."""
         try:
             out = subprocess.run(
-                ["ps", "-eo", "pid=,comm=,args="],
+                ["ps", "-eo", "pid=,ppid=,user=,comm=,args="],
                 capture_output=True, text=True, check=True, timeout=10,
             ).stdout
         except (subprocess.SubprocessError, FileNotFoundError):
             return []
         procs = []
         for line in out.splitlines()[1:]:
-            parts = line.split(None, 2)
-            if len(parts) < 3:
+            parts = line.split(None, 4)
+            if len(parts) < 5:
                 continue
-            pid_s, name, cmdline = parts
+            pid_s, ppid_s, user, name, cmdline = parts
             if pattern.lower() in cmdline.lower() and "guardian" not in cmdline.lower():
                 try:
-                    procs.append(cls(pid=int(pid_s), name=name, cmdline=cmdline))
+                    procs.append(cls(pid=int(pid_s), ppid=int(ppid_s), user=user,
+                                     name=name, cmdline=cmdline))
                 except ValueError:
                     continue
         return procs
+
+    def identity(self) -> dict[str, Any]:
+        return {"pid": self.pid, "ppid": self.ppid, "name": self.name,
+                "user": self.user, "cmdline": self.cmdline,
+                "exe": self.exe, "cwd": self.cwd}
 
 
 # --------------------------------------------------------------------------
@@ -622,6 +633,122 @@ def detect_threats(proc: AgentProcess, config: Config, signatures: list[str]) ->
 
 
 # --------------------------------------------------------------------------
+# Threat quarantine, provenance, reporting
+# --------------------------------------------------------------------------
+
+def trace_provenance(proc: AgentProcess, *, max_depth: int = 8) -> dict[str, Any]:
+    """Trace where a threat came from: exe, cwd, and the ancestor chain.
+
+    Walks parent PIDs via ps until init (ppid 0/1), a cycle, missing parent,
+    or max_depth. Each hop records pid/name/cmdline so the report identifies
+    the exact origin process (e.g. the shell or service that spawned it).
+    """
+    prov: dict[str, Any] = {"pid": proc.pid, "ppid": proc.ppid, "name": proc.name,
+                            "user": proc.user, "cmdline": proc.cmdline, "ancestors": []}
+    try:
+        prov["exe"] = os.readlink(f"/proc/{proc.pid}/exe")
+    except OSError:
+        prov["exe"] = ""
+    try:
+        prov["cwd"] = os.readlink(f"/proc/{proc.pid}/cwd")
+    except OSError:
+        prov["cwd"] = ""
+
+    ppid = proc.ppid
+    seen = {proc.pid}
+    for _ in range(max_depth):
+        if ppid in (0, 1) or ppid in seen:
+            break
+        seen.add(ppid)
+        try:
+            out = subprocess.run(
+                ["ps", "-o", "ppid=,comm=,args=", "-p", str(ppid)],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+        except (subprocess.SubprocessError, FileNotFoundError):
+            break
+        first = out.splitlines()[0] if out else ""  # one row per queried PID
+        parts = shlex.split(first) if first else []
+        if len(parts) < 2:
+            break  # parent gone (exited between scan and trace)
+        parent_ppid_s, parent_name = parts[0], parts[1]
+        parent_cmdline = parts[2] if len(parts) > 2 else parent_name
+        try:
+            parent_ppid = int(parent_ppid_s)
+        except ValueError:
+            break
+        prov["ancestors"].append({"pid": ppid, "name": parent_name,
+                                  "cmdline": parent_cmdline})
+        ppid = parent_ppid
+    return prov
+
+
+def quarantine_threat(proc: AgentProcess, det: Detection, risk: str, config: Config,
+                      *, dry_run: bool = False,
+                      safety: Optional[SafetyPolicy] = None) -> Optional[Path]:
+    """Always quarantine a detected threat, study it, trace its origin, report it.
+
+    Copies the threat's executable into the quarantine directory when it exists
+    on disk (studied offline without executing it); otherwise quarantines the
+    evidence record (cmdline, identity, provenance). Every decision — including
+    safety refusals — is audited, and the report goes to the alert channel.
+    """
+    tq = config.section("threat_quarantine")
+    if not tq.get("enabled", True):
+        return None
+    quarantine_dir = Path(str(tq.get("directory", "quarantine")))
+    policy = safety or SafetyPolicy(config)
+    prov = trace_provenance(proc)
+    evidence: dict[str, Any] = {
+        "detection": {"algorithm": det.algorithm, "description": det.description,
+                      "matched": det.matched, "base_risk": det.base_risk,
+                      "inaction_risk": risk},
+        "process": proc.identity(),
+        "provenance": prov,
+    }
+    exe = prov.get("exe") or ""
+    if exe and Path(exe).is_file():
+        evidence["threat_sha256"] = sha256_of(Path(exe))
+    origin = prov["ancestors"][-1] if prov["ancestors"] else None
+    origin_desc = (f"pid={origin['pid']} ({origin['name']})" if origin
+                   else "origin unknown (no living ancestors)")
+
+    target: Optional[Path] = None
+    if dry_run:
+        log_action("protection",
+                   f"DRY RUN: would quarantine threat from pid={proc.pid} ({proc.name}); "
+                   f"origin: {origin_desc}",
+                   agent_id=str(proc.pid), risk_level=risk,
+                   details={"quarantine_dir": str(quarantine_dir), "evidence": evidence})
+    else:
+        quarantine_dir.mkdir(exist_ok=True)
+        if exe and Path(exe).is_file():
+            target = quarantine_dir / f"pid{proc.pid}-{Path(exe).name}"
+            if policy.authorize_write(target):
+                shutil.copy2(exe, target)  # study the binary; never execute it
+            else:
+                target = None
+        record = quarantine_dir / f"threat_pid{proc.pid}.json"
+        if policy.authorize_write(record):
+            record.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+        log_action("protection",
+                   f"Quarantined threat from pid={proc.pid} ({proc.name}) for analysis; "
+                   f"origin: {origin_desc}",
+                   agent_id=str(proc.pid), risk_level=risk,
+                   details={"quarantined_to": str(target) if target else None,
+                            "evidence_record": str(record),
+                            "origin": origin, "evidence": evidence})
+
+    if tq.get("study_and_report", True):
+        send_alert(f"Threat quarantined from pid={proc.pid} ({proc.name}): "
+                   f"{det.description}; origin: {origin_desc}",
+                   risk_level=risk, agent_id=str(proc.pid),
+                   algorithm=det.algorithm, origin=origin,
+                   quarantined_to=str(target) if target else None)
+    return target
+
+
+# --------------------------------------------------------------------------
 # Risk assessment (risk of doing nothing)
 # --------------------------------------------------------------------------
 
@@ -725,13 +852,26 @@ def apply_update(file_path: Path, config: Config, *, dry_run: bool = False) -> b
     upd = config.updates
     if upd.get("verify_signatures", True):
         if not verify_signature(file_path, file_path.with_suffix(file_path.suffix + ".sig")):
-            quarantine_dir = Path("quarantine")
+            # Evidence hash before the move so the quarantined threat can be
+            # studied and its origin reported precisely.
+            evidence_hash = sha256_of(file_path) if file_path.exists() else None
+            tq = config.section("threat_quarantine")
+            quarantine_dir = Path(str(tq.get("directory", "quarantine"))) if tq.get("enabled", True) \
+                else Path("quarantine")
             quarantine_dir.mkdir(exist_ok=True)
             target = quarantine_dir / file_path.name
             if not dry_run and file_path.exists():
                 file_path.replace(target)
             log_action("update", f"Rejected unsigned update, quarantined: {file_path.name}",
-                       details={"quarantined_to": str(target)})
+                       details={"quarantined_to": str(target),
+                                "sha256": evidence_hash,
+                                "source": str(file_path)})
+            if tq.get("study_and_report", True):
+                send_alert(f"Malicious update quarantined: {file_path.name} "
+                           f"(sha256={evidence_hash}); origin: updates inbox "
+                           f"({file_path.parent})",
+                           risk_level="high", source=str(file_path),
+                           quarantined_to=str(target))
             return False
     backup: Optional[Path] = None
     if upd.get("rollback_on_failure", False) and file_path.exists() and not dry_run:
@@ -817,6 +957,7 @@ def run_cycle(config: Config, signatures: list[str], *, dry_run: bool = False,
                        agent_id=str(proc.pid), risk_level=risk,
                        details={"algorithm": det.algorithm, "matched": det.matched,
                                 "sensitive_path": protected})
+            quarantine_threat(proc, det, risk, config, dry_run=dry_run)
             if terminated:
                 continue  # already acted on this PID this cycle
             if config.risk_at_least(risk, escalate_on):

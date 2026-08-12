@@ -84,6 +84,12 @@ guardian_agent:
     block_sensitive_resource_access: true
     prevent_system_changes: true
 
+  threat_quarantine:
+    enabled: true
+    directory: quarantine  # isolated holding area for threat evidence
+    always: true  # quarantine every detected threat, not just terminated ones
+    study_and_report: true  # trace provenance (origin) and report each quarantined threat
+
 updates:
   auto_update: true  # always check for and apply updates automatically
   check_interval: 45m  # how often to check sources
@@ -130,3 +136,6 @@ todos:
   - task: automatic_authorized_updates
     description: Wire updates.auto_update/check_interval so signed updates in the inbox are applied automatically
     status: done  # check_updates() in guardian.py sweeps updates/inbox through the signature-gated apply_update()
+  - task: quarantine_and_report_threats
+    description: Always quarantine detected threats, study them, trace their exact origin, and report
+    status: done  # threat_quarantine section; quarantine_threat() + trace_provenance() in guardian.py
