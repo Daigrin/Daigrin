@@ -13,9 +13,11 @@ from guardian import (
     apply_update,
     assess_inaction_risk,
     behavioral_scan,
+    check_updates,
     detect_threats,
     load_signatures,
     ml_scan,
+    parse_interval,
     run_cycle,
     signature_scan,
     terminate_agent,
@@ -42,7 +44,7 @@ def make_config(**guardian_overrides):
             },
             "system_protection": {"enabled": True, "block_sensitive_resource_access": True},
         },
-        "updates": {"verify_signatures": True, "rollback_on_failure": True},
+        "updates": {"auto_update": True, "verify_signatures": True, "rollback_on_failure": True},
     }
     raw["guardian_agent"].update(guardian_overrides)
     return Config(raw)
@@ -248,6 +250,90 @@ class TestUpdates(unittest.TestCase):
         f = self.make_update()
         self.assertTrue(apply_update(f, cfg))
         self.assertFalse((self.dir / "backups" / "update.sh").exists())
+
+
+class TestCheckUpdates(unittest.TestCase):
+    def setUp(self):
+        import os
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.old_cwd = os.getcwd()
+        os.chdir(self.dir)
+        self.inbox = self.dir / "updates" / "inbox"
+        self.inbox.mkdir(parents=True)
+
+    def tearDown(self):
+        import os
+        os.chdir(self.old_cwd)
+        self.tmp.cleanup()
+
+    def drop_update(self, name, content=b"payload", sign=True):
+        f = self.inbox / name
+        f.write_bytes(content)
+        if sign:
+            f.with_suffix(f.suffix + ".sig").write_text(sha256_of(f))
+        return f
+
+    def test_signed_update_applied_automatically(self):
+        self.drop_update("a.sh")
+        self.assertEqual(check_updates(make_config()), 1)
+
+    def test_unsigned_update_quarantined_not_applied(self):
+        self.drop_update("evil.sh", sign=False)
+        self.assertEqual(check_updates(make_config()), 0)
+        self.assertFalse((self.inbox / "evil.sh").exists())
+        self.assertTrue((self.dir / "quarantine" / "evil.sh").exists())
+
+    def test_signature_files_not_treated_as_updates(self):
+        self.drop_update("a.sh")
+        self.drop_update("b.sh", content=b"other")
+        self.assertEqual(check_updates(make_config()), 2)
+
+    def test_missing_inbox_is_noop(self):
+        import shutil
+        shutil.rmtree(self.inbox)
+        self.assertEqual(check_updates(make_config()), 0)
+
+    def test_empty_inbox_is_noop(self):
+        self.assertEqual(check_updates(make_config()), 0)
+
+    def test_auto_update_disabled_refuses_and_audits(self):
+        self.drop_update("a.sh")
+        cfg = make_config()
+        cfg.raw["updates"]["auto_update"] = False
+        self.assertEqual(check_updates(cfg), 0)
+        self.assertTrue((self.inbox / "a.sh").exists())  # untouched
+        actions = [a["description"] for a in read_audit_trail(action_type="update")]
+        self.assertTrue(any("auto_update is false" in a for a in actions))
+
+    def test_update_sweep_is_audited(self):
+        self.drop_update("a.sh")
+        check_updates(make_config())
+        actions = [a["description"] for a in read_audit_trail(action_type="update")]
+        self.assertTrue(any("Applied update a.sh" in a for a in actions))
+        self.assertTrue(any("Update check complete: 1/1 applied" in a for a in actions))
+
+    def test_dry_run_logs_without_applying(self):
+        f = self.drop_update("a.sh")
+        self.assertEqual(check_updates(make_config(), dry_run=True), 1)
+        self.assertTrue(f.exists())
+        self.assertFalse((self.dir / "backups" / "a.sh").exists())
+
+
+class TestParseInterval(unittest.TestCase):
+    def test_units(self):
+        self.assertEqual(parse_interval("45m"), 2700.0)
+        self.assertEqual(parse_interval("30s"), 30.0)
+        self.assertEqual(parse_interval("1h"), 3600.0)
+        self.assertEqual(parse_interval("2d"), 172800.0)
+
+    def test_plain_seconds(self):
+        self.assertEqual(parse_interval("90"), 90.0)
+        self.assertEqual(parse_interval(120), 120.0)
+
+    def test_garbage_falls_back_to_default(self):
+        self.assertEqual(parse_interval("soon", default=7.0), 7.0)
+        self.assertEqual(parse_interval(None, default=3.0), 3.0)
 
 
 class TestSignaturesDB(unittest.TestCase):

@@ -87,7 +87,8 @@ guardian_agent:
 updates:
   auto_update: true  # always check for and apply updates automatically
   check_interval: 45m  # how often to check sources
-  verify_signatures: true  # only apply cryptographically signed updates
+  inbox: updates/inbox  # where incoming update packages land for the automatic sweep
+  verify_signatures: true  # only apply cryptographically signed updates (authorization gate)
   rollback_on_failure: true  # restore previous version if an update fails
 
   sources:
@@ -126,3 +127,6 @@ todos:
   - task: audit_logging
     description: Log all Guardian actions (detections, escalations, terminations, updates) to an audit trail
     status: done  # implemented in guardian_audit.py
+  - task: automatic_authorized_updates
+    description: Wire updates.auto_update/check_interval so signed updates in the inbox are applied automatically
+    status: done  # check_updates() in guardian.py sweeps updates/inbox through the signature-gated apply_update()
