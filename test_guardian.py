@@ -4,7 +4,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import guardian
 import guardian_audit
+import yaml
 from guardian import (
     AgentProcess,
     Config,
@@ -288,6 +290,10 @@ class TestCheckUpdates(unittest.TestCase):
         self.drop_update("a.sh")
         self.drop_update("b.sh", content=b"other")
         self.assertEqual(check_updates(make_config()), 2)
+        # .sig sidecars must be left alone: still in the inbox, never quarantined.
+        for name in ("a.sh.sig", "b.sh.sig"):
+            self.assertTrue((self.inbox / name).exists())
+            self.assertFalse((self.dir / "quarantine" / name).exists())
 
     def test_missing_inbox_is_noop(self):
         import shutil
@@ -338,6 +344,52 @@ class TestParseInterval(unittest.TestCase):
     def test_garbage_falls_back_to_default(self):
         self.assertEqual(parse_interval("soon", default=7.0), 7.0)
         self.assertEqual(parse_interval(None, default=3.0), 3.0)
+
+    def test_non_finite_falls_back_to_default(self):
+        self.assertEqual(parse_interval("nan", default=7.0), 7.0)
+        self.assertEqual(parse_interval("inf", default=7.0), 7.0)
+        self.assertEqual(parse_interval(float("nan"), default=7.0), 7.0)
+        self.assertEqual(parse_interval(float("inf"), default=7.0), 7.0)
+
+    def test_negative_falls_back_to_default(self):
+        self.assertEqual(parse_interval("-5", default=7.0), 7.0)
+        self.assertEqual(parse_interval(-5, default=7.0), 7.0)
+
+
+class TestMainUpdates(unittest.TestCase):
+    def test_once_calls_check_updates_even_when_auto_update_disabled(self):
+        """main() must not gate check_updates() on auto_update — the function
+        audits its own skip, so gating upstream would swallow the audit entry."""
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "audit.log"
+            with patch.object(guardian_audit, "AUDIT_LOG_PATH", log), \
+                 patch("guardian.AgentProcess.scan", return_value=[]), \
+                 patch("guardian.resolve_norton_signatures", return_value=[]), \
+                 patch("guardian.load_signatures", return_value=[]):
+                cfg = self._write_config(d, auto_update=False)
+                self.assertEqual(guardian.main(["--config", cfg, "--once"]), 0)
+            actions = [a["description"] for a in read_audit_trail(log, action_type="update")]
+            self.assertTrue(any("auto_update is false" in a for a in actions))
+
+    def test_once_no_updates_flag_skips_sweep_entirely(self):
+        """--no-updates opts out of the sweep: no update audit entries at all."""
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "audit.log"
+            with patch.object(guardian_audit, "AUDIT_LOG_PATH", log), \
+                 patch("guardian.AgentProcess.scan", return_value=[]), \
+                 patch("guardian.resolve_norton_signatures", return_value=[]), \
+                 patch("guardian.load_signatures", return_value=[]):
+                cfg = self._write_config(d, auto_update=True)
+                self.assertEqual(guardian.main(["--config", cfg, "--once", "--no-updates"]), 0)
+            self.assertEqual(read_audit_trail(log, action_type="update"), [])
+
+    def _write_config(self, d, *, auto_update):
+        cfg = Path(d) / "Guardian.yaml"
+        cfg.write_text(yaml.safe_dump({
+            "guardian_agent": {"enabled": True},
+            "updates": {"auto_update": auto_update},
+        }))
+        return str(cfg)
 
 
 class TestSignaturesDB(unittest.TestCase):

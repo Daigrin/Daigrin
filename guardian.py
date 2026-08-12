@@ -14,6 +14,7 @@ Usage:
 import argparse
 import hashlib
 import json
+import math
 import os
 import shlex
 import signal
@@ -46,16 +47,22 @@ _INTERVAL_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
 def parse_interval(value: Any, default: float = 60.0) -> float:
-    """Parse a duration like 45m, 30s, 1h, 2d (or plain seconds) into seconds."""
+    """Parse a duration like 45m, 30s, 1h, 2d (or plain seconds) into seconds.
+
+    Non-finite (nan/inf) or negative values fall back to ``default`` — a
+    nan/inf interval would silently disable the automatic update sweep.
+    """
     if isinstance(value, (int, float)):
-        return float(value)
+        seconds = float(value)
+        return seconds if math.isfinite(seconds) and seconds >= 0 else default
     text = str(value).strip().lower()
     if text and text[-1] in _INTERVAL_UNITS and text[:-1].isdigit():
         return float(text[:-1]) * _INTERVAL_UNITS[text[-1]]
     try:
-        return float(text)
+        seconds = float(text)
     except ValueError:
         return default
+    return seconds if math.isfinite(seconds) and seconds >= 0 else default
 
 
 def send_alert(message: str, *, risk_level: Optional[str] = None,
@@ -873,10 +880,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "adaptive_learning": learner.enabled(),
                         "self_scaling": scaler.enabled()})
 
-    updates_enabled = (not args.no_updates) and bool(config.updates.get("auto_update", False))
+    updates_enabled = not args.no_updates
 
     if args.once:
         if updates_enabled:
+            # check_updates() audits its own skip when updates.auto_update is false.
             applied = check_updates(config, dry_run=args.dry_run)
             print(f"Update check: {applied} update(s) applied.")
         acted = run_cycle(config, signatures, dry_run=args.dry_run, scan_pattern=args.pattern,
