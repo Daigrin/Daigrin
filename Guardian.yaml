@@ -90,6 +90,28 @@ guardian_agent:
     always: true  # quarantine every detected threat, not just terminated ones
     study_and_report: true  # trace provenance (origin) and report each quarantined threat
 
+  intrusion_detection:
+    # Defense against hackers and surveillance targeting this machine:
+    # detect intrusions, stop them, find where they came from, then report.
+    enabled: true
+    scan_network_connections: true  # inspect live sockets via ss (read-only)
+    flag_listeners: true  # unknown listening sockets are potential backdoors
+    allowed_listeners:  # ports expected to listen on this machine (not suspicious)
+      - 22  # sshd
+    suspicious_remote_ports:  # classic reverse-shell / C2 listener ports
+      - 4444  # metasploit default
+      - 1337
+      - 31337
+    surveillance_tools:  # process names that watch/record this machine
+      - tcpdump
+      - wireshark
+      - tshark
+      - keylogger
+      - nmap
+    stop_on: high  # least-force: stop the intrusion when inaction risk reaches this
+    require_confirmation: true  # operator confirms stops below critical
+    auto_stop_on_critical: true  # critical inaction risk bypasses confirmation
+
 updates:
   auto_update: true  # always check for and apply updates automatically
   check_interval: 45m  # how often to check sources

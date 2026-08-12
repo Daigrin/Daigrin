@@ -13,8 +13,10 @@ Usage:
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -125,6 +127,28 @@ class SafetyPolicy:
                                     pid=proc.pid, name=proc.name, risk=risk)
         return True
 
+    def authorize_intrusion_stop(self, intr: "Intrusion", *, detection: Optional["Detection"],
+                                 risk: Optional[str] = None) -> bool:
+        """Stopping an intrusion is allowed only if defensive, justified, and
+        never aimed at the guardian itself or unrelated processes."""
+        if not self.enabled():
+            return True
+        if detection is None and self.section().get("require_defensive_justification", True):
+            return self._refuse("stop_intrusion", "no detection justifies this action",
+                                pid=intr.pid, process=intr.process,
+                                remote=intr.conn.remote if intr.conn else "")
+        if self.section().get("scope_limited", True):
+            if "guardian" in intr.process.lower():
+                return self._refuse("stop_intrusion", "refusing to harm a guardian process (self or sibling)",
+                                    pid=intr.pid, process=intr.process)
+        if "least_force_first" in self.principles() and risk is not None:
+            # Least-force principle: stopping requires high or critical risk;
+            # lower severities are handled with monitoring and alerts only.
+            if RISK_ORDER.index(risk) < RISK_ORDER.index("high"):
+                return self._refuse("stop_intrusion", "least-force principle: risk below high does not justify stopping",
+                                    pid=intr.pid, process=intr.process, risk=risk)
+        return True
+
     def authorize_write(self, path: Path) -> bool:
         """Writes are allowed only to defensive artifacts (quarantine, backups, signature DB)."""
         if not self.enabled() or not self.section().get("never_modify_system_files", True):
@@ -180,6 +204,11 @@ class Config:
         return bool(self.guardian.get("enabled", False))
 
     def section(self, name: str) -> dict[str, Any]:
+        # core_directives is a top-level section (the prime directive governs
+        # the whole program, not just the guardian_agent subtree).
+        if name == "core_directives":
+            section = self.raw.get(name, {})
+            return section if isinstance(section, dict) else {}
         return self.guardian.get(name, {})
 
     def risk_at_least(self, level: str, threshold: str) -> bool:
@@ -522,6 +551,362 @@ DETECTORS = {
     "behavioral_based": behavioral_scan,
     "machine_learning": ml_scan,
 }
+
+
+# --------------------------------------------------------------------------
+# Intrusion & surveillance detection (network-facing defense)
+# --------------------------------------------------------------------------
+
+# Process names excluded from surveillance flagging: the defender must never
+# mistake itself (or its own observations) for the surveillor.
+SURVEILLANCE_EXCLUDED = ("guardian", "sshd")
+
+
+@dataclass
+class NetworkConnection:
+    """One live socket observed on this machine (read-only snapshot)."""
+    state: str            # LISTEN, ESTAB, ...
+    local: str            # "10.0.0.5:22"
+    remote: str           # "203.0.113.9:4444" or "*:*"
+    process: str = ""     # owning process name, if visible
+    pid: int = 0          # owning PID, if visible (0 = kernel/unknown)
+
+    @classmethod
+    def scan(cls) -> list["NetworkConnection"]:
+        """List live TCP sockets via ss without touching anything (defensive read)."""
+        try:
+            out = subprocess.run(
+                ["ss", "-tunap"],
+                capture_output=True, text=True, check=True, timeout=10,
+            ).stdout
+        except (subprocess.SubprocessError, FileNotFoundError):
+            return []
+        return cls.parse_ss(out)
+
+    @classmethod
+    def parse_ss(cls, out: str) -> list["NetworkConnection"]:
+        conns = []
+        for line in out.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            state = parts[1] if parts[0] in ("tcp", "udp") else parts[0]
+            # Row layout is fixed from the right: [.., local, remote, process?]
+            proc_field = parts[-1] if "users:" in parts[-1] else ""
+            local, remote = (parts[-3], parts[-2]) if proc_field else (parts[-2], parts[-1])
+            process, pid = "", 0
+            if proc_field:
+                m = re.search(r'"([^"]+)"', proc_field)
+                if m:
+                    process = m.group(1)
+                m = re.search(r"pid=(\d+)", proc_field)
+                if m:
+                    pid = int(m.group(1))
+            conns.append(cls(state=state, local=local, remote=remote,
+                             process=process, pid=pid))
+        return conns
+
+    def identity(self) -> dict[str, Any]:
+        return {"state": self.state, "local": self.local, "remote": self.remote,
+                "process": self.process, "pid": self.pid}
+
+
+def _split_host_port(endpoint: str) -> tuple[str, int]:
+    """Split 'host:port' (IPv4 or [v6]) into (host, port); port 0 if unknown."""
+    text = endpoint.strip().rstrip("%")
+    if text.startswith("[") and "]:" in text:  # [::1]:443
+        host, _, port_s = text[1:].partition("]:")
+    else:
+        host, _, port_s = text.rpartition(":")
+    try:
+        return host.strip("[]"), int(port_s)
+    except ValueError:
+        return host.strip("[]"), 0
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True for loopback/wildcard bind addresses (127.0.0.1, ::1, 0.0.0.0, *).
+
+    Loopback listeners serve local processes, not remote attackers, so they
+    are weak intrusion signals; wildcard binds (0.0.0.0) accept remote
+    connections and are *not* exempted.
+    """
+    if host == "*":
+        return True
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped  # ::ffff:127.0.0.1 is loopback too
+    return addr.is_loopback
+
+
+@dataclass
+class Intrusion:
+    """A detected hacking or surveillance attempt against this machine."""
+    kind: str                     # listener | reverse_shell | surveillance
+    conn: Optional[NetworkConnection]
+    detection: Detection
+    process: str = ""             # owning process name (surveillance tool or socket owner)
+    pid: int = 0
+
+    def describe(self) -> str:
+        where = f"{self.conn.local} <- {self.conn.remote}" if self.conn else "local process"
+        return f"{self.kind} via {self.process or 'unknown'} (pid={self.pid}) [{where}]"
+
+
+def detect_intrusions(config: Config,
+                      conns: Optional[list[NetworkConnection]] = None,
+                      procs: Optional[list[AgentProcess]] = None) -> list[Intrusion]:
+    """Find hacking attempts and surveillance aimed at this machine.
+
+    Read-only detection: inspects live sockets and the process table, never
+    probes the network or touches the suspected processes.
+    """
+    ids = config.section("intrusion_detection")
+    if not ids.get("enabled", False):
+        return []
+    findings: list[Intrusion] = []
+    if ids.get("scan_network_connections", True):
+        conns = NetworkConnection.scan() if conns is None else conns
+        findings.extend(_detect_network_intrusions(ids, conns))
+    procs = _scan_all_processes() if procs is None else procs
+    findings.extend(_detect_surveillance(ids, procs))
+    return findings
+
+
+def _scan_all_processes() -> list[AgentProcess]:
+    """Full process-table read (no pattern filter) for surveillance spotting."""
+    try:
+        out = subprocess.run(
+            ["ps", "-eo", "pid=,ppid=,user=,comm=,args="],
+            capture_output=True, text=True, check=True, timeout=10,
+        ).stdout
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return []
+    procs = []
+    for line in out.splitlines()[1:]:
+        parts = line.split(None, 4)
+        if len(parts) < 5:
+            continue
+        pid_s, ppid_s, user, name, cmdline = parts
+        try:
+            procs.append(AgentProcess(pid=int(pid_s), ppid=int(ppid_s), user=user,
+                                      name=name, cmdline=cmdline))
+        except ValueError:
+            continue
+    return procs
+
+
+def _listener_is_local_only(host: str, port: int,
+                            conns: list["NetworkConnection"]) -> bool:
+    """True when the listener cannot or does not talk to remote peers.
+
+    Loopback binds (127.0.0.1, ::1) are always local-only. Wildcard binds
+    (*, 0.0.0.0, ::) are treated as local-only when every observed connection
+    on that port involves loopback addresses — the common local dev-server /
+    IPC pattern — which keeps least-force restraint (no false stops) while
+    still flagging wildcard listeners with real remote exposure.
+    """
+    if host != "*" and _is_loopback_host(host):
+        return True
+    peers = [c for c in conns if c.state != "LISTEN"
+             and (_split_host_port(c.local)[1] == port
+                  or _split_host_port(c.remote)[1] == port)]
+    if not peers:
+        return False  # wildcard bind with no observed traffic: unknown exposure
+    for c in peers:
+        for endpoint in (c.local, c.remote):
+            ehost, _ = _split_host_port(endpoint)
+            if ehost == "*" or ehost == "0.0.0.0" or ehost == "::":
+                continue  # unconnected wildcard endpoint, not a remote peer
+            if not _is_loopback_host(ehost):
+                return False
+    return True
+
+
+def _detect_network_intrusions(ids: dict[str, Any],
+                               conns: list[NetworkConnection]) -> list[Intrusion]:
+    findings = []
+    allowed_ports = {int(p) for p in ids.get("allowed_listeners", [])}
+    suspicious_ports = {int(p) for p in ids.get("suspicious_remote_ports", [])}
+    flagged_listener_ports: set[int] = set()  # one finding per listening port
+    for conn in conns:
+        if "guardian" in conn.process.lower():
+            continue  # never flag ourselves
+        host, port = _split_host_port(conn.local)
+        if conn.state == "LISTEN" and ids.get("flag_listeners", True) \
+                and port not in allowed_ports and port > 0 \
+                and port not in flagged_listener_ports \
+                and not _listener_is_local_only(host, port, conns):
+            det = Detection("intrusion_detection",
+                            f"Unexpected listening socket on port {port} "
+                            f"(possible backdoor) owned by {conn.process or 'unknown'}",
+                            conn.local, "high")
+            findings.append(Intrusion("listener", conn, det, conn.process, conn.pid))
+            flagged_listener_ports.add(port)
+            continue
+        rhost, rport = _split_host_port(conn.remote)
+        if conn.state == "ESTAB" and rport in suspicious_ports:
+            det = Detection("intrusion_detection",
+                            f"Connection to suspicious remote port {rport} "
+                            f"({rhost}): possible reverse shell or C2 channel",
+                            conn.remote, "critical")
+            findings.append(Intrusion("reverse_shell", conn, det, conn.process, conn.pid))
+    return findings
+
+
+def _detect_surveillance(ids: dict[str, Any], procs: list[AgentProcess]) -> list[Intrusion]:
+    findings = []
+    tools = [str(t).lower() for t in ids.get("surveillance_tools", [])]
+    for proc in procs:
+        name = proc.name.lower()
+        if any(excluded in proc.cmdline.lower() for excluded in SURVEILLANCE_EXCLUDED):
+            continue  # never flag the defender or the login session
+        for tool in tools:
+            if tool and (tool in name or tool in proc.cmdline.lower()):
+                det = Detection("intrusion_detection",
+                                f"Surveillance tool running: {proc.name} (pid={proc.pid}) "
+                                f"may be watching or recording this machine",
+                                tool, "high")
+                findings.append(Intrusion("surveillance", None, det, proc.name, proc.pid))
+                break
+    return findings
+
+
+def assess_intrusion_risk(intr: Intrusion, config: Config) -> str:
+    """Escalate base risk based on what inaction against the intrusion allows."""
+    ra = config.section("risk_assessment")
+    if not ra.get("assess_inaction_risk", False):
+        return intr.detection.base_risk
+    # An open reverse shell/C2 channel means the attacker is already inside.
+    if intr.kind == "reverse_shell":
+        return "critical"
+    return intr.detection.base_risk
+
+
+def trace_intrusion_origin(intr: Intrusion) -> dict[str, Any]:
+    """Find where the intrusion came from: remote endpoint + owning process.
+
+    For socket-based intrusions the origin is the remote host and the local
+    process holding the socket (with its provenance chain). For surveillance
+    tools it is the tool's process and how it was launched.
+    """
+    origin: dict[str, Any] = {"kind": intr.kind, "process": intr.process, "pid": intr.pid}
+    if intr.conn is not None:
+        rhost, rport = _split_host_port(intr.conn.remote)
+        origin["remote_host"] = rhost
+        origin["remote_port"] = rport
+        origin["local"] = intr.conn.local
+    if intr.pid > 0:
+        proc = AgentProcess(pid=intr.pid, name=intr.process,
+                            cmdline=intr.process, ppid=0)
+        prov = trace_provenance(proc)
+        origin["exe"] = prov.get("exe", "")
+        origin["cwd"] = prov.get("cwd", "")
+        origin["ancestors"] = prov.get("ancestors", [])
+    return origin
+
+
+def quarantine_intrusion(intr: Intrusion, risk: str, config: Config,
+                         *, dry_run: bool = False,
+                         safety: Optional[SafetyPolicy] = None) -> Optional[Path]:
+    """Always preserve evidence of the intrusion, trace its origin, and report.
+
+    Writes an intrusion evidence record (connection/process identity, remote
+    endpoint, provenance) into the quarantine directory — never touches the
+    attacker or the network. Reporting goes through the audit trail and the
+    alert channel, exactly like process-threat quarantine.
+    """
+    tq = config.section("threat_quarantine")
+    if not tq.get("enabled", True):
+        return None
+    quarantine_dir = Path(str(tq.get("directory", "quarantine")))
+    policy = safety or SafetyPolicy(config)
+    origin = trace_intrusion_origin(intr)
+    evidence: dict[str, Any] = {
+        "detection": {"algorithm": intr.detection.algorithm,
+                      "description": intr.detection.description,
+                      "matched": intr.detection.matched,
+                      "base_risk": intr.detection.base_risk,
+                      "inaction_risk": risk},
+        "intrusion": {"kind": intr.kind, "process": intr.process, "pid": intr.pid,
+                      "connection": intr.conn.identity() if intr.conn else None},
+        "origin": origin,
+    }
+    remote = f"{origin.get('remote_host', '')}:{origin.get('remote_port', '')}".strip(":")
+    origin_desc = (f"remote {remote}" if remote else
+                   f"local process {intr.process} (pid={intr.pid})")
+    record = quarantine_dir / f"intrusion_{intr.kind}_pid{intr.pid}.json"
+    if dry_run:
+        log_action("protection",
+                   f"DRY RUN: would quarantine intrusion evidence: {intr.describe()}; "
+                   f"origin: {origin_desc}",
+                   agent_id=str(intr.pid), risk_level=risk,
+                   details={"quarantine_dir": str(quarantine_dir), "evidence": evidence})
+        return None
+    quarantine_dir.mkdir(exist_ok=True)
+    if not policy.authorize_write(record):
+        return None  # refused: nothing written; refusal already audited
+    record.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+    log_action("protection",
+               f"Quarantined intrusion evidence: {intr.describe()}; origin: {origin_desc}",
+               agent_id=str(intr.pid), risk_level=risk,
+               details={"evidence_record": str(record), "origin": origin,
+                        "evidence": evidence})
+    if tq.get("study_and_report", True):
+        send_alert(f"Intrusion recorded: {intr.detection.description}; "
+                   f"origin: {origin_desc}",
+                   risk_level=risk, agent_id=str(intr.pid),
+                   kind=intr.kind, origin=origin)
+    return record
+
+
+def stop_intrusion(intr: Intrusion, risk: str, config: Config, *,
+                   dry_run: bool = False,
+                   safety: Optional[SafetyPolicy] = None) -> bool:
+    """Stop an active intrusion: least-force, evidence-gated, never self-harm.
+
+    The only force used is ending the local process that owns the malicious
+    socket or runs the surveillance tool. No packets are sent and nothing is
+    written outside defensive artifacts — consistent with the prime directive.
+    """
+    policy = safety or SafetyPolicy(config)
+    if not policy.authorize_intrusion_stop(intr, detection=intr.detection, risk=risk):
+        return False
+    ids = config.section("intrusion_detection")
+    needs_confirm = ids.get("require_confirmation", True)
+    if ids.get("auto_stop_on_critical") and risk == "critical":
+        needs_confirm = False
+    if needs_confirm and not dry_run:
+        answer = input(f"Stop intrusion from PID {intr.pid} ({intr.process})? "
+                       f"risk={risk} [y/N] ")
+        if answer.strip().lower() != "y":
+            log_action("termination", f"Intrusion stop declined for PID {intr.pid}",
+                       agent_id=str(intr.pid), risk_level=risk)
+            return False
+    if intr.pid <= 0:
+        log_action("termination",
+                   f"Cannot stop intrusion {intr.kind}: no owning process to stop",
+                   agent_id=str(intr.pid), risk_level=risk,
+                   details={"kind": intr.kind})
+        return False
+    if dry_run:
+        return True
+    try:
+        proc_kill(intr.pid)
+    except ProcessLookupError:
+        return True  # already gone
+    except PermissionError as e:
+        log_action("termination", f"Failed to stop intrusion PID {intr.pid}: {e}",
+                   agent_id=str(intr.pid), risk_level=risk)
+        return False
+    log_action("termination",
+               f"Stopped intrusion {intr.kind} by terminating PID {intr.pid} ({intr.process})",
+               agent_id=str(intr.pid), risk_level=risk,
+               details={"connection": intr.conn.identity() if intr.conn else None})
+    return True
 
 
 class AdaptiveLearner:
@@ -971,6 +1356,31 @@ def run_cycle(config: Config, signatures: list[str], *, dry_run: bool = False,
                                    detection=det, scan_pattern=scan_pattern):
                     acted += 1
                     terminated = True
+
+    # Intrusion & surveillance defense: find hacking/surveillance aimed at this
+    # machine, record + report it, and stop it when inaction risk is high.
+    ids = config.section("intrusion_detection")
+    stop_on = str(ids.get("stop_on", escalate_on))
+    stopped_pids: set[int] = set()
+    for intr in detect_intrusions(config):
+        risk = assess_intrusion_risk(intr, config)
+        log_action("detection", f"INTRUSION: {intr.detection.description}",
+                   agent_id=str(intr.pid), risk_level=risk,
+                   details={"algorithm": intr.detection.algorithm, "kind": intr.kind,
+                            "matched": intr.detection.matched,
+                            "connection": intr.conn.identity() if intr.conn else None})
+        quarantine_intrusion(intr, risk, config, dry_run=dry_run)
+        if intr.pid in stopped_pids:
+            continue  # already stopped this process this cycle
+        if config.risk_at_least(risk, stop_on):
+            log_action("escalation", f"Intrusion inaction risk {risk} >= {stop_on}, escalating",
+                       agent_id=str(intr.pid), risk_level=risk)
+            if risk != "critical":
+                send_alert(f"INTRUSION: {intr.detection.description}",
+                           risk_level=risk, agent_id=str(intr.pid), kind=intr.kind)
+            if stop_intrusion(intr, risk, config, dry_run=dry_run):
+                acted += 1
+                stopped_pids.add(intr.pid)
 
     if learner is not None:
         learner.absorb(detections_seen)
