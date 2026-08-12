@@ -1,4 +1,6 @@
 import json
+import platform
+import signal
 import tempfile
 import unittest
 from pathlib import Path
@@ -886,6 +888,136 @@ class TestStopIntrusion(unittest.TestCase):
             self.assertTrue(stop_intrusion(self.make_intr(), "critical",
                                            make_intrusion_config(), dry_run=True))
             kill.assert_not_called()
+
+
+class TestCrossPlatform(unittest.TestCase):
+    """Guardian must run on any OS / any device and degrade gracefully."""
+
+    def test_host_platform_known(self):
+        import guardian
+        self.assertIn(guardian.host_platform(),
+                      ("linux", "windows", "macos") + (platform.system().lower(),))
+
+    def test_active_sensitive_paths_posix(self):
+        import guardian
+        with patch("guardian.host_platform", return_value="linux"):
+            self.assertIn("/etc", guardian.active_sensitive_paths())
+
+    def test_active_sensitive_paths_windows(self):
+        import guardian
+        with patch("guardian.host_platform", return_value="windows"):
+            paths = guardian.active_sensitive_paths()
+        self.assertTrue(any("windows" in p for p in paths))
+
+    def test_parse_netstat_windows(self):
+        out = (
+            "\n  Proto  Local Address          Foreign Address        State           PID\n"
+            "  TCP    0.0.0.0:22             0.0.0.0:0              LISTENING      800\n"
+            "  TCP    10.0.0.5:51515        203.0.113.9:4444       ESTABLISHED    777\n"
+        )
+        conns = NetworkConnection.parse_netstat(out)
+        self.assertEqual(len(conns), 2)
+        self.assertEqual((conns[0].state, conns[0].pid), ("LISTEN", 800))
+        self.assertEqual((conns[1].state, conns[1].remote), ("ESTAB", "203.0.113.9:4444"))
+
+    def test_parse_netstat_posix_with_process(self):
+        out = (
+            "Proto Recv-Q Send-Q Local Address   Foreign Address  State    PID/Program\n"
+            "tcp   0      0      0.0.0.0:22      0.0.0.0:*        LISTEN   800/sshd\n"
+        )
+        conns = NetworkConnection.parse_netstat(out)
+        self.assertEqual((conns[0].state, conns[0].process, conns[0].pid),
+                         ("LISTEN", "sshd", 800))
+
+    def test_scan_processes_windows_parses_csv(self):
+        import guardian
+        csv_out = '"chrome.exe","1234","Console","1","100,000 K","Running","ME\\u","0:00:01","Tab"\n'
+        with patch("guardian.host_platform", return_value="windows"), \
+             patch("guardian.subprocess.run") as run:
+            run.return_value = type("R", (), {"stdout": csv_out})()
+            procs = guardian._scan_processes_windows()
+        self.assertEqual(procs[0].pid, 1234)
+        self.assertEqual(procs[0].name, "chrome.exe")
+
+    def test_proc_kill_posix_uses_sigterm_first(self):
+        """Least force: SIGTERM is sent before any SIGKILL on POSIX."""
+        import guardian
+        calls = []
+
+        def fake_kill(pid, sig):
+            calls.append(sig)
+            raise ProcessLookupError  # process gone after SIGTERM
+
+        with patch("guardian.host_platform", return_value="linux"), \
+             patch("guardian.os.kill", side_effect=fake_kill):
+            guardian.proc_kill(4321)
+        self.assertEqual(calls, [signal.SIGTERM])
+
+
+class TestMiniYaml(unittest.TestCase):
+    """The vendored zero-dependency YAML fallback must match PyYAML."""
+
+    def test_matches_pyyaml_on_guardian_config(self):
+        import yaml
+        import guardian_miniyaml
+        text = Path("Guardian.yaml").read_text(encoding="utf-8")
+        self.assertEqual(guardian_miniyaml.safe_load(text), yaml.safe_load(text))
+
+    def test_safe_load_scalars_and_lists(self):
+        import guardian_miniyaml
+        doc = "a: 1\nb: true\nc: hi\nd:\n  - x\n  - 2\ne: [1, 2, 3]\n"
+        self.assertEqual(guardian_miniyaml.safe_load(doc),
+                         {"a": 1, "b": True, "c": "hi", "d": ["x", 2],
+                          "e": [1, 2, 3]})
+
+    def test_safe_load_stream(self):
+        import guardian_miniyaml
+        import io
+        self.assertEqual(guardian_miniyaml.safe_load(io.StringIO("a: 5\n")),
+                         {"a": 5})
+
+    def test_safe_load_dash_mapping(self):
+        import guardian_miniyaml
+        doc = "todos:\n  - task: a\n    status: done\n  - task: b\n"
+        self.assertEqual(guardian_miniyaml.safe_load(doc),
+                         {"todos": [{"task": "a", "status": "done"},
+                                    {"task": "b"}]})
+
+
+class TestGenericIntegrations(unittest.TestCase):
+    """Security-software integrations work with any vendor, not just Norton."""
+
+    def make_cfg(self, **integrations):
+        return Config(raw={"guardian_agent": {"enabled": True},
+                           "integrations": integrations})
+
+    def test_local_signature_feed_any_vendor(self):
+        import guardian
+        with tempfile.TemporaryDirectory() as d:
+            feed = Path(d) / "defender_signatures.json"
+            feed.write_text(json.dumps({"signatures": ["bad-cmd-1", "bad-cmd-2"]}))
+            cfg = self.make_cfg(defender={"enabled": True,
+                                          "signature_feed": str(feed)})
+            sigs = guardian.resolve_integration_signatures(cfg)
+        self.assertIn("bad-cmd-1", sigs)
+        self.assertIn("bad-cmd-2", sigs)
+
+    def test_disabled_integration_contributes_nothing(self):
+        import guardian
+        cfg = self.make_cfg(crowdstrike={"enabled": False})
+        self.assertEqual(guardian.resolve_integration_signatures(cfg), [])
+
+    def test_missing_feed_is_audited_not_fatal(self):
+        import guardian
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "audit.log"
+            cfg = self.make_cfg(acme={"enabled": True,
+                                      "signature_feed": str(Path(d) / "nope.json")})
+            with patch.object(guardian_audit, "AUDIT_LOG_PATH", log):
+                sigs = guardian.resolve_integration_signatures(cfg)
+            self.assertEqual(sigs, [])
+            descs = [e["description"] for e in read_audit_trail(log, action_type="update")]
+            self.assertTrue(any("acme signature feed not found" in x for x in descs))
 
 
 class TestRunCycle(unittest.TestCase):

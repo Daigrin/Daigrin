@@ -1,14 +1,20 @@
-"""Guardian agent — runnable supervisor.
+"""Guardian agent — cross-platform, runnable supervisor for any device.
 
 Loads Guardian.yaml, monitors agent processes, detects threats, assesses the
 risk of inaction, terminates malicious agents, enforces system protection,
-checks for threat-intel updates, and logs everything to the audit trail.
+detects intrusions and surveillance, checks for threat-intel updates, and logs
+everything to the audit trail.
+
+Guardian is built to help people first: it is defensive-only, runs on any OS
+(Linux, macOS, Windows, and any device with Python 3), and degrades gracefully
+when a platform lacks a capability.
 
 Usage:
     python3 guardian.py                     # run the monitor loop
     python3 guardian.py --once              # single scan cycle and exit
     python3 guardian.py --dry-run           # detect and log without killing
     python3 guardian.py --config FILE       # alternate config file
+    guardian --once                         # same, after `pip install .`
 """
 
 import argparse
@@ -16,6 +22,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -29,7 +36,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-import yaml
+try:
+    import yaml  # PyYAML when available
+except ImportError:  # zero-dependency fallback for any device
+    import guardian_miniyaml as yaml  # type: ignore[no-redef]
 
 from guardian_audit import log_action
 
@@ -37,10 +47,38 @@ CONFIG_PATH = Path("Guardian.yaml")
 RISK_ORDER = ("low", "medium", "high", "critical")
 
 # Sensitive paths the guardian protects from modification by managed agents.
-SENSITIVE_PATHS = ("/etc", "/bin", "/sbin", "/usr/bin", "/boot", str(Path.home() / ".ssh"))
+SENSITIVE_PATHS = ("/etc", "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/boot",
+                   str(Path.home() / ".ssh"))
 
 # Where applied updates are snapshotted for rollback_on_failure.
 BACKUP_DIR = Path("backups")
+
+# --- Platform awareness: Guardian runs on any OS / any device ----------------
+
+def host_platform() -> str:
+    """Report the host OS: 'windows', 'macos', 'linux', or the raw system name."""
+    system = platform.system().lower()
+    return {"darwin": "macos"}.get(system, system or "unknown")
+
+
+def windows_sensitive_paths() -> tuple[str, ...]:
+    """Protected locations on Windows hosts (env-driven, case-insensitive)."""
+    roots = [os.environ.get("SystemRoot", r"C:\Windows"),
+             os.environ.get("ProgramFiles", r"C:\Program Files"),
+             os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")]
+    return tuple(r.lower() for r in roots if r)
+
+
+def active_sensitive_paths() -> tuple[str, ...]:
+    """Sensitive paths for the current host OS (empty on unknown platforms)."""
+    if host_platform() == "windows":
+        return windows_sensitive_paths()
+    return SENSITIVE_PATHS
+
+
+def have_command(name: str) -> bool:
+    """True when a system command exists on this device (graceful degradation)."""
+    return shutil.which(name) is not None
 
 # Where incoming updates land for the automatic check_updates() sweep.
 DEFAULT_UPDATES_INBOX = Path("updates/inbox")
@@ -154,8 +192,9 @@ class SafetyPolicy:
         if not self.enabled() or not self.section().get("never_modify_system_files", True):
             return True
         normalized = str(path)
-        for sensitive in SENSITIVE_PATHS:
-            if normalized.startswith(sensitive):
+        cmp = normalized.lower() if host_platform() == "windows" else normalized
+        for sensitive in active_sensitive_paths():
+            if cmp.startswith(sensitive):
                 return self._refuse("write", "path is a protected system location", path=normalized)
         if any(normalized.startswith(root) for root in self.ALLOWED_WRITE_ROOTS):
             return True
@@ -232,25 +271,10 @@ class AgentProcess:
     @classmethod
     def scan(cls, pattern: str = "agent") -> list["AgentProcess"]:
         """Find running processes whose command line matches a pattern."""
-        try:
-            out = subprocess.run(
-                ["ps", "-eo", "pid=,ppid=,user=,comm=,args="],
-                capture_output=True, text=True, check=True, timeout=10,
-            ).stdout
-        except (subprocess.SubprocessError, FileNotFoundError):
-            return []
         procs = []
-        for line in out.splitlines()[1:]:
-            parts = line.split(None, 4)
-            if len(parts) < 5:
-                continue
-            pid_s, ppid_s, user, name, cmdline = parts
-            if pattern.lower() in cmdline.lower() and "guardian" not in cmdline.lower():
-                try:
-                    procs.append(cls(pid=int(pid_s), ppid=int(ppid_s), user=user,
-                                     name=name, cmdline=cmdline))
-                except ValueError:
-                    continue
+        for proc in _scan_all_processes():
+            if pattern.lower() in proc.cmdline.lower() and "guardian" not in proc.cmdline.lower():
+                procs.append(proc)
         return procs
 
     def identity(self) -> dict[str, Any]:
@@ -501,6 +525,117 @@ def resolve_norton_signatures(config: Config, mode_override: Optional[str] = Non
     return load_norton_signatures(config)
 
 
+# --------------------------------------------------------------------------
+# Generic security-software integrations (any vendor, not just Norton)
+# --------------------------------------------------------------------------
+
+def _integrations_config(config: Config) -> dict[str, Any]:
+    integrations = config.raw.get("integrations", {})
+    return integrations if isinstance(integrations, dict) else {}
+
+
+def _load_integration_signature_file(feed_path: Path, name: str,
+                                     keys: list[str]) -> list[str]:
+    """Load a local JSON signature export from any security product."""
+    if not feed_path.exists():
+        log_action("update", f"{name} signature feed not found",
+                   details={"integration": name, "path": str(feed_path)})
+        return []
+    try:
+        data = json.loads(feed_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        log_action("update", f"{name} signature feed is not valid JSON",
+                   details={"integration": name, "path": str(feed_path)})
+        return []
+    raw: list[str] = []
+    if isinstance(data, list):
+        raw = [s for s in data if isinstance(s, str)]
+    elif isinstance(data, dict):
+        for key in keys:
+            values = data.get(key, [])
+            if isinstance(values, list):
+                raw.extend(s for s in values if isinstance(s, str))
+    signatures = [s.strip() for s in raw if s.strip()]
+    unique = list(dict.fromkeys(signatures))
+    log_action("update", f"Loaded {name} signatures ({len(unique)})",
+               details={"integration": name, "path": str(feed_path)})
+    return unique
+
+
+def _fetch_integration_signatures_live(name: str, section: dict[str, Any]) -> list[str]:
+    """Fetch signatures from any security product's API endpoint.
+
+    Defensive read-only GET; honors retries, and caches for offline use.
+    Never sends anything beyond the GET request.
+    """
+    live = section.get("live", {})
+    endpoint = str(live.get("endpoint", "")).strip()
+    if not endpoint:
+        return []
+    api_key_env = str(live.get("api_key_env", "")).strip()
+    api_key = os.environ.get(api_key_env, "").strip() if api_key_env else ""
+    timeout = float(live.get("timeout_seconds", 8))
+    retries = int(live.get("retries", 2))
+    backoff = float(live.get("retry_backoff_seconds", 1))
+    max_retry_after = float(live.get("max_retry_after_seconds", 120))
+    cache_path = Path(str(live.get("cache_file", f"{name}_signatures.cache.json")))
+
+    headers = {"Accept": "application/json", "User-Agent": "Daigrin-Guardian/1.0"}
+    if api_key:
+        headers["Authorization"] = "******"
+    request = urllib.request.Request(endpoint, headers=headers)
+    for attempt in range(retries + 1):
+        try:
+            data = _http_get_json(request, timeout)
+            raw = data if isinstance(data, list) else \
+                (data.get("signatures", []) if isinstance(data, dict) else [])
+            sigs = [s.strip() for s in raw if isinstance(s, str) and s.strip()]
+            unique = list(dict.fromkeys(sigs))
+            cache_path.write_text(json.dumps(unique), encoding="utf-8")
+            log_action("update", f"Fetched {name} live signatures ({len(unique)})",
+                       details={"integration": name, "mode": "live",
+                                "attempts": attempt + 1})
+            return unique
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+            if attempt < retries:
+                time.sleep(_retry_delay_seconds(e, attempt, backoff, max_retry_after))
+            else:
+                log_action("update", f"{name} live fetch failed: {e}",
+                           details={"integration": name, "mode": "live",
+                                    "attempts": retries + 1})
+    # offline fallback: cached copy, then the local file
+    cached = _load_integration_signature_file(cache_path, name, ["signatures"])
+    if cached:
+        return cached
+    keys = section.get("signature_keys", ["signatures", "indicators", "commands"])
+    return _load_integration_signature_file(
+        Path(str(section.get("signature_feed", f"{name}_signatures.json"))), name, keys)
+
+
+def resolve_integration_signatures(config: Config) -> list[str]:
+    """Merge signatures from every enabled security product (any vendor).
+
+    Each entry under ``integrations:`` is a product; ``norton`` keeps its
+    dedicated resolver (local/live), and any other product (e.g. defender,
+    crowdstrike, sentinelone) uses the generic local-file or live-API path.
+    """
+    merged: list[str] = []
+    for name, section in _integrations_config(config).items():
+        if name == "norton":
+            merged.extend(resolve_norton_signatures(config))
+            continue
+        if not isinstance(section, dict) or not section.get("enabled", False):
+            continue
+        keys = section.get("signature_keys", ["signatures", "indicators", "commands"])
+        mode = str(section.get("mode", "local")).strip().lower()
+        if mode == "live":
+            merged.extend(_fetch_integration_signatures_live(name, section))
+        else:
+            feed = Path(str(section.get("signature_feed", f"{name}_signatures.json")))
+            merged.extend(_load_integration_signature_file(feed, name, keys))
+    return list(dict.fromkeys(merged))
+
+
 def signature_scan(proc: AgentProcess, signatures: list[str]) -> Optional[Detection]:
     """Signature-based detection: match command line against known-bad patterns."""
     for sig in signatures:
@@ -525,8 +660,9 @@ def anomaly_scan(proc: AgentProcess) -> Optional[Detection]:
 
 def behavioral_scan(proc: AgentProcess) -> Optional[Detection]:
     """Behavioral detection: touches sensitive paths or shell-pipe patterns."""
-    for path in SENSITIVE_PATHS:
-        if path in proc.cmdline and any(w in proc.cmdline for w in ("rm", "mv", "chmod", "chown", ">", "dd")):
+    cmdline = proc.cmdline.lower() if host_platform() == "windows" else proc.cmdline
+    for path in active_sensitive_paths():
+        if path in cmdline and any(w in proc.cmdline for w in ("rm", "mv", "chmod", "chown", ">", "dd", "del", "format")):
             return Detection("behavioral_based", f"Modifies sensitive path {path}", proc.cmdline[:80], "high")
     if ("curl" in proc.cmdline or "wget" in proc.cmdline) and ("| sh" in proc.cmdline or "|sh" in proc.cmdline or "| bash" in proc.cmdline):
         return Detection("behavioral_based", "Download piped directly to shell", proc.cmdline[:80], "critical")
@@ -561,6 +697,12 @@ DETECTORS = {
 # mistake itself (or its own observations) for the surveillor.
 SURVEILLANCE_EXCLUDED = ("guardian", "sshd")
 
+# netstat connection-state names normalized to ss-style (LISTEN / ESTAB).
+_NETSTAT_STATES = {
+    "LISTENING": "LISTEN", "LISTEN": "LISTEN",
+    "ESTABLISHED": "ESTAB", "ESTAB": "ESTAB",
+}
+
 
 @dataclass
 class NetworkConnection:
@@ -573,17 +715,71 @@ class NetworkConnection:
 
     @classmethod
     def scan(cls) -> list["NetworkConnection"]:
-        """List live TCP sockets via ss without touching anything (defensive read)."""
-        try:
-            out = subprocess.run(
-                ["ss", "-tunap"],
-                capture_output=True, text=True, check=True, timeout=10,
-            ).stdout
-        except (subprocess.SubprocessError, FileNotFoundError) as e:
-            log_action("detection", f"Network connection scan unavailable: {e}",
-                       details={"source": "ss -tunap"})
-            return []
-        return cls.parse_ss(out)
+        """List live sockets without touching anything (defensive read).
+
+        Works on any OS: Linux `ss`, then `netstat` (Linux/macOS/Windows).
+        Returns [] (audited) when the device has no supported socket tool.
+        """
+        if have_command("ss"):
+            try:
+                out = subprocess.run(
+                    ["ss", "-tunap"],
+                    capture_output=True, text=True, check=True, timeout=10,
+                ).stdout
+                return cls.parse_ss(out)
+            except (subprocess.SubprocessError, FileNotFoundError) as e:
+                log_action("detection", f"ss scan failed, trying netstat: {e}",
+                           details={"source": "ss -tunap"})
+        if have_command("netstat"):
+            try:
+                args = (["netstat", "-ano", "-p", "tcp"] if host_platform() == "windows"
+                        else ["netstat", "-anp"])
+                out = subprocess.run(
+                    args, capture_output=True, text=True, check=True, timeout=15,
+                ).stdout
+                return cls.parse_netstat(out)
+            except (subprocess.SubprocessError, FileNotFoundError) as e:
+                log_action("detection", f"netstat scan failed: {e}",
+                           details={"source": "netstat", "platform": host_platform()})
+                return []
+        log_action("detection", "No network socket tool available on this device",
+                   details={"platform": host_platform(), "tried": ["ss", "netstat"]})
+        return []
+
+    @classmethod
+    def parse_netstat(cls, out: str) -> list["NetworkConnection"]:
+        """Parse netstat -anp (POSIX) and netstat -ano -p tcp (Windows).
+
+        netstat gives no process name in unprivileged/Windows output, so
+        process is '' and pid is 0 (POSIX -p needs root) or the PID (Windows
+        -o). State names are normalized to ss-style (LISTEN/ESTAB).
+        """
+        conns = []
+        for line in out.splitlines():
+            parts = line.split()
+            if not parts or parts[0].lower() not in ("tcp", "udp", "tcpv6", "udpv6"):
+                continue
+            proto = parts[0].lower()
+            is_windows = parts[-1].isdigit() and len(parts) >= 5 and \
+                parts[-2].upper() in _NETSTAT_STATES
+            if is_windows:  # proto local remote state pid
+                local, remote, state, pid_s = parts[1], parts[2], parts[3], parts[4]
+                process = ""
+            elif len(parts) >= 7:  # proto rq sq local remote state pid/prog
+                local, remote, state = parts[3], parts[4], parts[5]
+                pid_s, _, process = parts[6].partition("/")
+            elif len(parts) >= 6:  # proto rq sq local remote state
+                local, remote, state = parts[3], parts[4], parts[5]
+                pid_s, process = "0", ""
+            else:
+                continue
+            try:
+                pid = int(pid_s)
+            except ValueError:
+                pid = 0
+            conns.append(cls(state=_NETSTAT_STATES.get(state.upper(), state.upper()),
+                             local=local, remote=remote, process=process, pid=pid))
+        return conns
 
     @classmethod
     def parse_ss(cls, out: str) -> list["NetworkConnection"]:
@@ -604,8 +800,8 @@ class NetworkConnection:
                 m = re.search(r"pid=(\d+)", proc_field)
                 if m:
                     pid = int(m.group(1))
-            conns.append(cls(state=state, local=local, remote=remote,
-                             process=process, pid=pid))
+            conns.append(cls(state=_NETSTAT_STATES.get(state.upper(), state.upper()),
+                             local=local, remote=remote, process=process, pid=pid))
         return conns
 
     def identity(self) -> dict[str, Any]:
@@ -684,7 +880,17 @@ def detect_intrusions(config: Config,
 
 
 def _scan_all_processes() -> list[AgentProcess]:
-    """Full process-table read (no pattern filter) for surveillance spotting."""
+    """Full process-table read (no pattern filter) for surveillance spotting.
+
+    Works on any OS: POSIX via `ps`, Windows via `tasklist /v /fo csv`.
+    Returns [] (audited) when the device offers no supported listing tool.
+    """
+    if host_platform() == "windows":
+        return _scan_processes_windows()
+    return _scan_processes_posix()
+
+
+def _scan_processes_posix() -> list[AgentProcess]:
     try:
         out = subprocess.run(
             ["ps", "-eo", "pid=,ppid=,user=,comm=,args="],
@@ -692,7 +898,7 @@ def _scan_all_processes() -> list[AgentProcess]:
         ).stdout
     except (subprocess.SubprocessError, FileNotFoundError) as e:
         log_action("detection", f"Process table scan unavailable: {e}",
-                   details={"source": "ps -eo"})
+                   details={"source": "ps -eo", "platform": host_platform()})
         return []
     procs = []
     for line in out.splitlines()[1:]:
@@ -705,6 +911,33 @@ def _scan_all_processes() -> list[AgentProcess]:
                                       name=name, cmdline=cmdline))
         except ValueError:
             continue
+    return procs
+
+
+def _scan_processes_windows() -> list[AgentProcess]:
+    """Windows process read via tasklist CSV (ppid/user not available -> 0/'')."""
+    import csv
+    import io
+    try:
+        out = subprocess.run(
+            ["tasklist", "/v", "/fo", "csv", "/nh"],
+            capture_output=True, text=True, check=True, timeout=15,
+        ).stdout
+    except (subprocess.SubprocessError, FileNotFoundError) as e:
+        log_action("detection", f"Process table scan unavailable: {e}",
+                   details={"source": "tasklist /v /fo csv", "platform": "windows"})
+        return []
+    procs = []
+    for row in csv.reader(io.StringIO(out)):
+        # "name.exe","pid","session name","session#","mem","status","user","cpu","title"
+        if len(row) < 2:
+            continue
+        name, pid_s = row[0], row[1]
+        try:
+            pid = int(pid_s)
+        except ValueError:
+            continue
+        procs.append(AgentProcess(pid=pid, ppid=0, user="", name=name, cmdline=name))
     return procs
 
 
@@ -801,7 +1034,13 @@ def assess_intrusion_risk(intr: Intrusion, config: Config) -> str:
 
 
 def _proc_ppid(pid: int) -> int:
-    """Read a process's parent PID from /proc (0 if unreadable)."""
+    """Read a process's parent PID from /proc (POSIX only).
+
+    Returns 0 when /proc is unavailable (Windows, or the process is gone), so
+    provenance degrades to "origin unknown" instead of crashing.
+    """
+    if not Path("/proc").is_dir():
+        return 0
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
         # Field 4 is ppid; the comm (field 2) may contain spaces/parens, so
@@ -1055,19 +1294,25 @@ def trace_provenance(proc: AgentProcess, *, max_depth: int = 8) -> dict[str, Any
     """
     prov: dict[str, Any] = {"pid": proc.pid, "ppid": proc.ppid, "name": proc.name,
                             "user": proc.user, "cmdline": proc.cmdline, "ancestors": []}
-    try:
-        prov["exe"] = os.readlink(f"/proc/{proc.pid}/exe")
-    except OSError:
+    # exe/cwd come from /proc (POSIX). Windows and other platforms have no
+    # /proc, so provenance is best-effort: empty exe/cwd, no ancestor walk.
+    if have_command("ps"):
+        try:
+            prov["exe"] = os.readlink(f"/proc/{proc.pid}/exe")
+        except OSError:
+            prov["exe"] = ""
+        try:
+            prov["cwd"] = os.readlink(f"/proc/{proc.pid}/cwd")
+        except OSError:
+            prov["cwd"] = ""
+    else:
         prov["exe"] = ""
-    try:
-        prov["cwd"] = os.readlink(f"/proc/{proc.pid}/cwd")
-    except OSError:
         prov["cwd"] = ""
 
     ppid = proc.ppid
     seen = {proc.pid}
     for _ in range(max_depth):
-        if ppid in (0, 1) or ppid in seen:
+        if ppid in (0, 1) or ppid in seen or not have_command("ps"):
             break
         seen.add(ppid)
         try:
@@ -1220,7 +1465,31 @@ def terminate_agent(proc: AgentProcess, risk: str, config: Config, *, dry_run: b
 
 
 def proc_kill(pid: int) -> None:
-    """Send SIGKILL to a process (isolated for testability)."""
+    """Terminate a process on any OS (isolated for testability).
+
+    Least force first: a graceful SIGTERM is attempted before SIGKILL on
+    POSIX; on Windows os.kill terminates the process, falling back to
+    `taskkill /F` when the signal API is unavailable.
+    """
+    if host_platform() == "windows":
+        try:
+            os.kill(pid, signal.SIGTERM)  # CPython maps this to TerminateProcess
+            return
+        except (OSError, AttributeError):
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                           capture_output=True, timeout=10, check=True)
+            return
+    try:
+        os.kill(pid, signal.SIGTERM)  # least force: ask politely first
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)  # still alive?
+            except ProcessLookupError:
+                return  # exited after SIGTERM
+            time.sleep(0.05)
+    except ProcessLookupError:
+        return
     os.kill(pid, signal.SIGKILL)
 
 
@@ -1230,8 +1499,9 @@ def check_protection(proc: AgentProcess, config: Config) -> Optional[str]:
     if not sp.get("enabled"):
         return None
     if sp.get("block_sensitive_resource_access"):
-        for path in SENSITIVE_PATHS:
-            if path in proc.cmdline:
+        cmdline = proc.cmdline.lower() if host_platform() == "windows" else proc.cmdline
+        for path in active_sensitive_paths():
+            if path in cmdline:
                 return path
     return None
 
@@ -1440,14 +1710,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
 
     signatures = load_signatures()
-    signatures = list(dict.fromkeys(signatures + resolve_norton_signatures(config, args.norton_mode)))
+    if args.norton_mode:  # explicit per-run override for Norton only
+        signatures = list(dict.fromkeys(
+            signatures + resolve_norton_signatures(config, args.norton_mode)))
+    else:  # any enabled security product: Norton, Defender, CrowdStrike, ...
+        signatures = list(dict.fromkeys(signatures + resolve_integration_signatures(config)))
     learner = AdaptiveLearner(config)
     scaler = SelfScaler(config)
     log_action("detection",  # lifecycle marker in the audit trail
                f"Guardian started (pattern={args.pattern!r}, dry_run={args.dry_run})",
                details={"signatures_loaded": len(signatures),
                         "adaptive_learning": learner.enabled(),
-                        "self_scaling": scaler.enabled()})
+                        "self_scaling": scaler.enabled(),
+                        "platform": host_platform(),
+                        "os": platform.platform()})
 
     updates_enabled = (not args.no_updates) and bool(config.updates.get("auto_update", False))
 

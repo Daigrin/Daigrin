@@ -1,5 +1,11 @@
 guardian_audit.log
 quarantine/
+backups/
 __pycache__/
 .daily-learn-request
 .daily-learn.log
+# packaging artifacts
+build/
+dist/
+*.egg-info/
+
