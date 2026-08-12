@@ -28,3 +28,8 @@ Cross-agent learning record for this repo's custom agents (Guardian Engineer, Gu
 - **Lesson**: Review findings are only useful if actionable — every observation must name the file:line and the minimal fix, or it gets ignored.
 - **Evidence**: First audit of the customization suite; the single observation with a concrete fix (hook matching) was implemented the same session.
 - **Applied to**: .github/agents/guardian-auditor.agent.md (Output Format section).
+
+### 2026-08-12 — Guardian Engineer
+- **Lesson**: Tests that bypass a safety gate go stale when the gate is strengthened — always pass the justifying context (detection) on allowed-path tests and keep a refusal-path test asserting the SAFETY REFUSAL audit entry.
+- **Evidence**: `SafetyPolicy.authorize_termination` gained the `require_defensive_justification` check; three TestTermination tests calling `terminate_agent()` without `detection=` failed (29 passed / 3 failed baseline).
+- **Applied to**: test_guardian.py (detection-justified allowed paths, `test_no_detection_is_refused_and_audited`), guardian.py (removed duplicate `import os` in proc_kill), Guardian.yaml (todos statuses), README.md (config section sync).

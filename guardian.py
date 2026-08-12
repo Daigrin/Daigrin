@@ -39,6 +39,24 @@ SENSITIVE_PATHS = ("/etc", "/bin", "/sbin", "/usr/bin", "/boot", str(Path.home()
 # Where applied updates are snapshotted for rollback_on_failure.
 BACKUP_DIR = Path("backups")
 
+# Where incoming updates land for the automatic check_updates() sweep.
+DEFAULT_UPDATES_INBOX = Path("updates/inbox")
+
+_INTERVAL_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def parse_interval(value: Any, default: float = 60.0) -> float:
+    """Parse a duration like 45m, 30s, 1h, 2d (or plain seconds) into seconds."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().lower()
+    if text and text[-1] in _INTERVAL_UNITS and text[:-1].isdigit():
+        return float(text[:-1]) * _INTERVAL_UNITS[text[-1]]
+    try:
+        return float(text)
+    except ValueError:
+        return default
+
 
 def send_alert(message: str, *, risk_level: Optional[str] = None,
                agent_id: Optional[str] = None, **details: Any) -> None:
@@ -666,7 +684,6 @@ def terminate_agent(proc: AgentProcess, risk: str, config: Config, *, dry_run: b
 
 def proc_kill(pid: int) -> None:
     """Send SIGKILL to a process (isolated for testability)."""
-    import os
     os.kill(pid, signal.SIGKILL)
 
 
@@ -733,6 +750,41 @@ def apply_update(file_path: Path, config: Config, *, dry_run: bool = False) -> b
     return applied_ok
 
 
+def check_updates(config: Config, *, inbox: Optional[Path] = None,
+                  dry_run: bool = False) -> int:
+    """Automatically check the updates inbox and apply authorized updates.
+
+    Every candidate goes through apply_update(), so the authorization gates
+    stay identical to a manual apply: verify_signatures must pass (unsigned or
+    tampered files are quarantined, never applied), rollback_on_failure
+    snapshots before staging, and every decision hits the audit trail.
+    Returns the number of updates applied.
+    """
+    upd = config.updates
+    if not upd.get("auto_update", False):
+        log_action("update", "Automatic update check skipped: updates.auto_update is false")
+        return 0
+    inbox = Path(upd.get("inbox", DEFAULT_UPDATES_INBOX)) if inbox is None else inbox
+    if not inbox.is_dir():
+        log_action("update", f"No updates found: inbox {inbox} does not exist",
+                   details={"inbox": str(inbox)})
+        return 0
+    candidates = sorted(p for p in inbox.iterdir()
+                        if p.is_file() and p.suffix != ".sig")
+    if not candidates:
+        log_action("update", f"No updates found in {inbox}",
+                   details={"inbox": str(inbox)})
+        return 0
+    applied = 0
+    for candidate in candidates:
+        if apply_update(candidate, config, dry_run=dry_run):
+            applied += 1
+    log_action("update", f"Update check complete: {applied}/{len(candidates)} applied",
+               details={"inbox": str(inbox), "candidates": len(candidates),
+                        "applied": applied, "dry_run": dry_run})
+    return applied
+
+
 # --------------------------------------------------------------------------
 # Main loop
 # --------------------------------------------------------------------------
@@ -797,6 +849,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="override integrations.norton.mode for this run")
     parser.add_argument("--norton-compat-check", action="store_true",
                         help="print Norton compatibility diagnostics and exit")
+    parser.add_argument("--no-updates", action="store_true",
+                        help="skip the automatic updates sweep for this run")
     args = parser.parse_args(argv)
 
     config = Config.load(args.config)
@@ -819,15 +873,25 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "adaptive_learning": learner.enabled(),
                         "self_scaling": scaler.enabled()})
 
+    updates_enabled = (not args.no_updates) and bool(config.updates.get("auto_update", False))
+
     if args.once:
+        if updates_enabled:
+            applied = check_updates(config, dry_run=args.dry_run)
+            print(f"Update check: {applied} update(s) applied.")
         acted = run_cycle(config, signatures, dry_run=args.dry_run, scan_pattern=args.pattern,
                           learner=learner, scaler=scaler)
         print(f"Scan complete: {acted} threat(s) acted on.")
         return 0
 
+    update_interval = parse_interval(config.updates.get("check_interval"), default=2700.0)
+    last_update_check = 0.0  # fire the first sweep at the start of the first iteration
     print(f"Guardian running: scanning every {args.interval}s for {args.pattern!r} processes. Ctrl-C to stop.")
     try:
         while True:
+            if updates_enabled and time.monotonic() - last_update_check >= update_interval:
+                check_updates(config, dry_run=args.dry_run)
+                last_update_check = time.monotonic()
             run_cycle(config, signatures, dry_run=args.dry_run, scan_pattern=args.pattern,
                       learner=learner, scaler=scaler)
             time.sleep(args.interval)
