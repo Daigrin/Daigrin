@@ -1291,28 +1291,37 @@ def trace_provenance(proc: AgentProcess, *, max_depth: int = 8) -> dict[str, Any
     Walks parent PIDs via ps until init (ppid 0/1), a cycle, missing parent,
     or max_depth. Each hop records pid/name/cmdline so the report identifies
     the exact origin process (e.g. the shell or service that spawned it).
+
+    Graceful degradation: on platforms without /proc (macOS, Windows) or
+    when /proc/ps reads fail, this returns whatever partial provenance it
+    could gather and never raises. Every gap is disclosed in the audit
+    trail via log_action() — a degraded trace is never silent.
     """
     prov: dict[str, Any] = {"pid": proc.pid, "ppid": proc.ppid, "name": proc.name,
                             "user": proc.user, "cmdline": proc.cmdline, "ancestors": []}
+    unavailable: list[str] = []  # provenance gaps, disclosed in the audit trail
+    ps_available = have_command("ps")
     # exe/cwd come from /proc (POSIX). Windows and other platforms have no
     # /proc, so provenance is best-effort: empty exe/cwd, no ancestor walk.
-    if have_command("ps"):
+    for key, link in (("exe", f"/proc/{proc.pid}/exe"),
+                      ("cwd", f"/proc/{proc.pid}/cwd")):
+        if not ps_available:
+            prov[key] = ""
+            unavailable.append(f"{key} (no /proc on this platform)")
+            continue
         try:
-            prov["exe"] = os.readlink(f"/proc/{proc.pid}/exe")
+            prov[key] = os.readlink(link)
         except OSError:
-            prov["exe"] = ""
-        try:
-            prov["cwd"] = os.readlink(f"/proc/{proc.pid}/cwd")
-        except OSError:
-            prov["cwd"] = ""
-    else:
-        prov["exe"] = ""
-        prov["cwd"] = ""
+            prov[key] = ""
+            unavailable.append(f"{key} ({link} unreadable)")
 
     ppid = proc.ppid
     seen = {proc.pid}
     for _ in range(max_depth):
-        if ppid in (0, 1) or ppid in seen or not have_command("ps"):
+        if ppid in (0, 1) or ppid in seen:
+            break
+        if not ps_available:
+            unavailable.append("ancestor walk (ps unavailable on this platform)")
             break
         seen.add(ppid)
         try:
@@ -1320,7 +1329,8 @@ def trace_provenance(proc: AgentProcess, *, max_depth: int = 8) -> dict[str, Any
                 ["ps", "-o", "ppid=,comm=,args=", "-p", str(ppid)],
                 capture_output=True, text=True, timeout=5,
             ).stdout.strip()
-        except (subprocess.SubprocessError, FileNotFoundError):
+        except (subprocess.SubprocessError, FileNotFoundError) as e:
+            unavailable.append(f"ancestor walk (ps failed at pid {ppid}: {e})")
             break
         first = out.splitlines()[0] if out else ""  # one row per queried PID
         parts = shlex.split(first) if first else []
@@ -1335,6 +1345,16 @@ def trace_provenance(proc: AgentProcess, *, max_depth: int = 8) -> dict[str, Any
         prov["ancestors"].append({"pid": ppid, "name": parent_name,
                                   "cmdline": parent_cmdline})
         ppid = parent_ppid
+    if unavailable:
+        prov["unavailable"] = unavailable
+        log_action("protection",
+                   f"Partial provenance for pid={proc.pid} ({proc.name}): "
+                   f"could not obtain {', '.join(unavailable)}",
+                   agent_id=str(proc.pid),
+                   details={"pid": proc.pid, "name": proc.name,
+                            "platform": host_platform(),
+                            "unavailable": unavailable,
+                            "ancestors_traced": len(prov["ancestors"])})
     return prov
 
 

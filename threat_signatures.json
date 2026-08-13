@@ -1,0 +1,13 @@
+{
+  "signatures": [
+    "rm -rf /",
+    "mkfs",
+    ":(){ :|:& };:",
+    "nc -l",
+    "/dev/tcp/",
+    "base64 -d",
+    "chmod 777 /",
+    "curl",
+    "wget"
+  ]
+}

