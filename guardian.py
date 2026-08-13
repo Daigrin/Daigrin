@@ -1300,12 +1300,15 @@ def trace_provenance(proc: AgentProcess, *, max_depth: int = 8) -> dict[str, Any
     prov: dict[str, Any] = {"pid": proc.pid, "ppid": proc.ppid, "name": proc.name,
                             "user": proc.user, "cmdline": proc.cmdline, "ancestors": []}
     unavailable: list[str] = []  # provenance gaps, disclosed in the audit trail
-    ps_available = have_command("ps")
-    # exe/cwd come from /proc (POSIX). Windows and other platforms have no
-    # /proc, so provenance is best-effort: empty exe/cwd, no ancestor walk.
+    # exe/cwd come from /proc (POSIX). Gate on /proc itself, not on ps: macOS
+    # has ps but no /proc, so ps availability is the wrong proxy here.
+    proc_available = Path("/proc").is_dir()
+    ps_available = have_command("ps")  # gates the ancestor walk below
+    # Windows, macOS, and other platforms have no /proc, so exe/cwd provenance
+    # is best-effort: empty values, gaps disclosed in the audit trail.
     for key, link in (("exe", f"/proc/{proc.pid}/exe"),
                       ("cwd", f"/proc/{proc.pid}/cwd")):
-        if not ps_available:
+        if not proc_available:
             prov[key] = ""
             unavailable.append(f"{key} (no /proc on this platform)")
             continue

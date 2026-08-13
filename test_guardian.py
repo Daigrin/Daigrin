@@ -507,9 +507,11 @@ class TestTraceProvenance(unittest.TestCase):
         self.assertEqual(entries[0]["details"]["ancestors_traced"], 1)
 
     def test_no_proc_platform_degrades_gracefully_and_audits(self):
-        """Platforms without /proc (ps absent): exe/cwd are empty, no ancestor
-        walk is attempted, nothing raises, and every gap is audited."""
+        """Platforms without /proc (e.g. macOS, which still has ps): exe/cwd
+        are empty, nothing raises, and every gap is audited. The walk is gated
+        on ps; here ps is absent too, so no ancestor walk is attempted."""
         with patch.object(guardian_audit, "AUDIT_LOG_PATH", self.log), \
+             patch("guardian.Path.is_dir", return_value=False), \
              patch("guardian.have_command", return_value=False), \
              patch("guardian.subprocess.run") as run:
             prov = trace_provenance(AgentProcess(4321, "agent", "agent evil", ppid=1001))
