@@ -724,14 +724,18 @@ def apply_update(file_path: Path, config: Config, *, dry_run: bool = False) -> b
     """Verify and stage an update; quarantine + rollback hooks included."""
     upd = config.updates
     if upd.get("verify_signatures", True):
-        if not verify_signature(file_path, file_path.with_suffix(file_path.suffix + ".sig")):
+        sig_path = file_path.with_suffix(file_path.suffix + ".sig")
+        if not verify_signature(file_path, sig_path):
             quarantine_dir = Path("quarantine")
             quarantine_dir.mkdir(exist_ok=True)
             target = quarantine_dir / file_path.name
             if not dry_run and file_path.exists():
                 file_path.replace(target)
-            log_action("update", f"Rejected unsigned update, quarantined: {file_path.name}",
-                       details={"quarantined_to": str(target)})
+            if sig_path.exists():
+                reason = f"Rejected update with invalid signature, quarantined: {file_path.name}"
+            else:
+                reason = f"Rejected unsigned update, quarantined: {file_path.name}"
+            log_action("update", reason, details={"quarantined_to": str(target)})
             return False
     backup: Optional[Path] = None
     if upd.get("rollback_on_failure", False) and file_path.exists() and not dry_run:

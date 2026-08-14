@@ -227,6 +227,31 @@ class TestUpdates(unittest.TestCase):
         self.assertFalse(f.exists())
         self.assertTrue((self.dir / "quarantine" / "update.sh").exists())
 
+    def test_unsigned_update_audit_says_unsigned(self):
+        f = self.make_update(sign=False)
+        log = self.dir / "audit.log"
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", log):
+            self.assertFalse(apply_update(f, make_config()))
+        actions = [a["description"] for a in read_audit_trail(log, action_type="update")]
+        self.assertTrue(any("Rejected unsigned update" in a for a in actions))
+
+    def test_invalid_signature_update_quarantined(self):
+        f = self.make_update()
+        f.write_bytes(b"tampered")
+        self.assertFalse(apply_update(f, make_config()))
+        self.assertFalse(f.exists())
+        self.assertTrue((self.dir / "quarantine" / "update.sh").exists())
+
+    def test_invalid_signature_update_audit_distinguishes_tampering(self):
+        f = self.make_update()
+        f.write_bytes(b"tampered")
+        log = self.dir / "audit.log"
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", log):
+            self.assertFalse(apply_update(f, make_config()))
+        actions = [a["description"] for a in read_audit_trail(log, action_type="update")]
+        self.assertTrue(any("invalid signature" in a for a in actions))
+        self.assertFalse(any("Rejected unsigned update" in a for a in actions))
+
     def test_signed_update_applied(self):
         f = self.make_update()
         self.assertTrue(apply_update(f, make_config()))
