@@ -188,8 +188,7 @@ class TestUpdates(unittest.TestCase):
         self.assertTrue(target.exists())
         entries = read_audit_trail(log, action_type="update")
         self.assertEqual(entries[-1]["details"]["quarantined_to"], str(Path("quarantine") / "update.sh"))
-        self.assertIn("Rejected unsigned update", entries[-1]["description"])
-
+        self.assertIn("Rejected update (invalid signature)", entries[-1]["description"])
     def test_signed_update_applied(self):
         f = self.make_update()
         self.assertTrue(apply_update(f, make_config()))
