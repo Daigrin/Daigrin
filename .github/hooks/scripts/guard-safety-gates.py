@@ -83,9 +83,8 @@ def main():
         allow()
         return
 
-    current_logs = current.count("log_action(")
-    proposed_logs = proposed.count("log_action(")
-    if proposed_logs < current_logs:
+    current_logs = current.count("log_action(") + current.count("log_action (")
+    proposed_logs = proposed.count("log_action(") + proposed.count("log_action (")
         deny(f"Refusing to remove Guardian audit coverage from {path.name}: log_action() count would drop from {current_logs} to {proposed_logs}.")
         return
 
