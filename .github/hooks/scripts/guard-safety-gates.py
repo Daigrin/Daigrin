@@ -44,7 +44,8 @@ def target_path(data):
     for field in PATH_FIELDS:
         value = data.get(field)
         if isinstance(value, str):
-            return Path(value)
+            # Only operate on repo files; ignore any directory components.
+            return Path(Path(value).name)
     return None
 
 
