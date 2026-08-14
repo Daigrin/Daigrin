@@ -238,7 +238,9 @@ class TestUpdates(unittest.TestCase):
     def test_invalid_signature_update_quarantined(self):
         f = self.make_update()
         f.write_bytes(b"tampered")
-        self.assertFalse(apply_update(f, make_config()))
+        log = self.dir / "audit.log"
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", log):
+            self.assertFalse(apply_update(f, make_config()))
         self.assertFalse(f.exists())
         self.assertTrue((self.dir / "quarantine" / "update.sh").exists())
 
