@@ -85,10 +85,10 @@ guardian_agent:
     prevent_system_changes: true
 
   self_scaling:
-    enabled: true  # split into extra guardian workers when threat load spikes
+    enabled: true  # split into extra guardian spawns when threat load spikes
     split_threshold: 3  # detections in one cycle that trigger a split
     min_agents: 1
-    max_agents: 8  # hard cap on total guardians (1 parent + up to 7 spawned workers)
+    max_agents: 8  # hard cap on total guardians (1 parent + up to 7 spawns)
     cooldown_cycles: 2  # cycles to wait between splits
 
 updates:

@@ -670,11 +670,11 @@ class AdaptiveLearner:
 
 
 class SelfScaler:
-    """Split the guardian into bounded worker processes when workload spikes."""
+    """Split the guardian into bounded spawn processes when workload spikes."""
 
     def __init__(self, config: Config) -> None:
         self.config = config
-        self.active_children: list[subprocess.Popen] = []
+        self.active_spawns: list[subprocess.Popen] = []
         self.cooldown_left = 0
 
     def section(self) -> dict[str, Any]:
@@ -692,7 +692,7 @@ class SelfScaler:
         min_agents = int(section.get("min_agents", 1))
         cooldown_cycles = int(section.get("cooldown_cycles", 2))
 
-        self.active_children = [p for p in self.active_children if p.poll() is None]
+        self.active_spawns = [p for p in self.active_spawns if p.poll() is None]
         if self.cooldown_left > 0:
             self.cooldown_left -= 1
             return 0
@@ -700,7 +700,7 @@ class SelfScaler:
             return 0
 
         desired_total = min(max_agents, max(min_agents, threat_count))
-        spawn_count = max(0, desired_total - (1 + len(self.active_children)))
+        spawn_count = max(0, desired_total - (1 + len(self.active_spawns)))
         if spawn_count <= 0:
             return 0
 
@@ -710,12 +710,12 @@ class SelfScaler:
             if dry_run:
                 cmd.append("--dry-run")
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.active_children.append(proc)
+            self.active_spawns.append(proc)
             spawned += 1
 
         self.cooldown_left = cooldown_cycles
-        log_action("escalation", f"Self-scaling spawned {spawned} guardian worker(s)",
-                   details={"active_children": len(self.active_children),
+        log_action("escalation", f"Self-scaling spawned {spawned} guardian spawn(s)",
+                   details={"active_spawns": len(self.active_spawns),
                             "threat_count": threat_count, "threshold": threshold})
         return spawned
 

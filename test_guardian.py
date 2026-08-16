@@ -413,7 +413,7 @@ class TestRunCycle(unittest.TestCase):
 
 
 class TestSelfScaling(unittest.TestCase):
-    """Guardian splits into as many workers as the threat load needs —
+    """Guardian splits into as many spawns as the threat load needs —
     not always max_agents — bounded by threshold, cooldown, and the cap."""
 
     def make_scaler(self, log: Path, **overrides) -> SelfScaler:
@@ -438,7 +438,7 @@ class TestSelfScaling(unittest.TestCase):
             child.poll.return_value = None
             with patch.object(guardian_audit, "AUDIT_LOG_PATH", log), \
                  patch("guardian.subprocess.Popen", return_value=child) as popen:
-                # 4 threats => 4 guardians total: 1 parent + 3 workers (not 8)
+                # 4 threats => 4 guardians total: 1 parent + 3 spawns (not 8)
                 spawned = scaler.maybe_split(4, scan_pattern="agent", dry_run=True)
             self.assertEqual(spawned, 3)
             self.assertEqual(popen.call_count, 3)
@@ -461,7 +461,7 @@ class TestSelfScaling(unittest.TestCase):
             with patch.object(guardian_audit, "AUDIT_LOG_PATH", log), \
                  patch("guardian.subprocess.Popen", return_value=child) as popen:
                 spawned = scaler.maybe_split(20, scan_pattern="agent", dry_run=True)
-            self.assertEqual(spawned, 4)  # 5 total: 1 parent + 4 workers
+            self.assertEqual(spawned, 4)  # 5 total: 1 parent + 4 spawns
             self.assertEqual(popen.call_count, 4)
 
     def test_below_threshold_does_not_split(self):
@@ -486,11 +486,11 @@ class TestSelfScaling(unittest.TestCase):
                 for _ in range(2):  # cooldown cycles
                     self.assertEqual(scaler.maybe_split(8, scan_pattern="agent", dry_run=True), 0)
                     popen.assert_not_called()
-                # cooldown expired; 8 threats - (1 parent + 3 active workers) = 4 more
+                # cooldown expired; 8 threats - (1 parent + 3 active spawns) = 4 more
                 self.assertEqual(scaler.maybe_split(8, scan_pattern="agent", dry_run=True), 4)
                 self.assertEqual(popen.call_count, 4)
 
-    def test_dead_workers_are_not_counted(self):
+    def test_dead_spawns_are_not_counted(self):
         with tempfile.TemporaryDirectory() as d:
             log = Path(d) / "audit.log"
             scaler = self.make_scaler(log, cooldown_cycles=0)
@@ -500,13 +500,13 @@ class TestSelfScaling(unittest.TestCase):
             dead.poll.return_value = 0  # exited
             with patch.object(guardian_audit, "AUDIT_LOG_PATH", log), \
                  patch("guardian.subprocess.Popen", return_value=alive) as popen:
-                scaler.active_children = [dead]
-                # maybe_split returns newly spawned workers; dead worker pruned first,
-                # so 3 threats => 3 total - 1 parent = 2 new workers
+                scaler.active_spawns = [dead]
+                # maybe_split returns newly created spawns; dead spawn pruned first,
+                # so 3 threats => 3 total - 1 parent = 2 new spawns
                 spawned = scaler.maybe_split(3, scan_pattern="agent", dry_run=True)
             self.assertEqual(spawned, 2)
             self.assertEqual(popen.call_count, 2)
-            self.assertEqual(scaler.active_children, [alive, alive])  # dead pruned
+            self.assertEqual(scaler.active_spawns, [alive, alive])  # dead pruned
 
     def test_live_mode_split_omits_dry_run_flag(self):
         with tempfile.TemporaryDirectory() as d:
