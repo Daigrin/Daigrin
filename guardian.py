@@ -589,7 +589,7 @@ def glm_scan(proc: AgentProcess, glm_cfg: dict[str, Any]) -> Optional[Detection]
         content = data["choices"][0]["message"]["content"]
 
         # Tolerate code-fence wrappers: extract first {...} block
-        m = re.search(r"\{.*\}", content, re.DOTALL)
+        m = re.search(r"\{.*?\}", content, re.DOTALL)
         if not m:
             raise ValueError(f"No JSON object found in GLM response: {content!r}")
         result = json.loads(m.group())

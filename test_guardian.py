@@ -8,6 +8,8 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import yaml
+
 import guardian_audit
 from guardian import (
     AgentProcess,
@@ -581,7 +583,6 @@ class TestGLMIntegration(unittest.TestCase):
                 "updates": {"auto_update": False},
                 "integrations": {"glm": {"enabled": False}},
             }
-            import yaml
             cfg_path.write_text(yaml.dump(raw))
             captured = io.StringIO()
             with patch("sys.stdout", captured):
