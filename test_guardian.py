@@ -506,7 +506,8 @@ class TestSelfScaling(unittest.TestCase):
                 spawned = scaler.maybe_split(3, scan_pattern="agent", dry_run=True)
             self.assertEqual(spawned, 2)
             self.assertEqual(popen.call_count, 2)
-            self.assertEqual(scaler.active_spawns, [alive, alive])  # dead pruned
+            self.assertNotIn(dead, scaler.active_spawns)  # dead spawn pruned
+            self.assertEqual(scaler.active_spawns, [alive, alive])
 
     def test_live_mode_split_omits_dry_run_flag(self):
         with tempfile.TemporaryDirectory() as d:
