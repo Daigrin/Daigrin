@@ -22,3 +22,21 @@ Set `integrations.glm.enabled: true` in Guardian.yaml to route the `machine_lear
 - **`min_confidence`** — float 0–1; GLM scores below this are not treated as detections (default `0.8`)
 - **`fallback_to_heuristic`** — if `true` (default), any API error or missing key falls back to the built-in `ml_scan` heuristic so monitoring is never degraded
 - **`--glm-test [CMDLINE]`** — ad-hoc CLI flag: loads config, scores CMDLINE (or a default probe) via `glm_scan`, prints the Detection as JSON (or `null` if disabled/clean), and exits
+
+## Benchmark harnesses
+
+The [benchmarks/](benchmarks/) package scores Guardian's *defensive* performance — detection and guardrail behavior — without ever executing attack payloads or generating exploits (consistent with the prime directive):
+
+```sh
+python3 -m benchmarks list                 # available suites
+python3 -m benchmarks all                  # run all suites with curated samples
+python3 -m benchmarks cybergym-defense --dataset my_samples.jsonl --json
+```
+
+| Suite | What it scores | Dataset input |
+|---|---|---|
+| `cybergym-defense` | Detection of exploit-style cmdlines (CyberGym measures *offensive* PoC generation, which Guardian refuses by design; this scores the defender side instead) | JSONL `{"id", "label", "text"}` cmdlines (default: [datasets/cybergym_defense.jsonl](benchmarks/datasets/cybergym_defense.jsonl)) |
+| `malskill` | Detection of malicious agent skills (MalSkillBench / MaliciousAgentSkillsBench style) | JSONL, or a skill tree with `malware/` and `benign/` dirs of skill packages |
+| `gabench-guardrail` | Guardrail behavior: malicious scenarios must be detected **and** acted on; benign ones left alone (GABench-style), replayed through `run_cycle` in dry-run | JSONL scenarios with optional `expected_action` meta |
+
+Each suite reports detection rate (recall), false-positive rate, precision, accuracy, and F1. Curated sample datasets ship under [benchmarks/datasets/](benchmarks/datasets/); Guardian scores 100% detection / 0% false positives on all three curated sets. Point `--dataset` at a real benchmark export (e.g. MalSkillBench's `Dataset/Skills/`) for a full run.
