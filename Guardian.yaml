@@ -91,6 +91,12 @@ guardian_agent:
     max_agents: 8  # hard cap on total guardians (1 parent + up to 7 spawns)
     cooldown_cycles: 2  # cycles to wait between splits
 
+  remediation_advisory:
+    enabled: true  # advise operators when a managed agent runs known-vulnerable software
+    advisory_feed: advisories.json  # vendor-neutral advisory DB (JSON); missing/invalid => no advisories
+    min_severity: low  # ignore advisories below this severity (low/medium/high/critical)
+    alert_on_advisory: true  # send_alert() for each matched advisory (always audit-logged regardless)
+
 updates:
   auto_update: true  # always check for and apply updates automatically
   check_interval: 45m  # how often to check sources

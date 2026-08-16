@@ -23,6 +23,25 @@ When the threat load spikes, the guardian splits into extra processes — **"Spa
 
 Spawns run `guardian.py --once --pattern <pattern>` (plus `--dry-run` when the parent is in dry-run), and every split is written to the audit trail as an `escalation` entry with the threat count and active spawns.
 
+### Remediation advisory (`remediation_advisory`)
+
+Guardian doesn't just spot weak areas and log them — it tells the operator how to close them. When a managed agent's cmdline matches a known-vulnerable product/version in the advisory feed, Guardian sends an operator alert and writes an `escalation` audit entry with the advisory ID, severity, affected version, and recommended fix. Advisory-only by design: matches never feed termination and never modify the affected software (least force first — Guardian advises, the operator patches).
+
+- **`enabled`** — turn the advisory scan on/off (default `false`; `true` in this config)
+- **`advisory_feed`** — path to the vendor-neutral advisory DB (default `advisories.json`). Missing or invalid JSON degrades to zero advisories with an audit entry, never an error
+- **`min_severity`** — ignore advisories below this severity (`low`/`medium`/`high`/`critical`; default `low`)
+- **`alert_on_advisory`** — send an operator alert per match (default `true`); the audit entry is written either way
+
+Feed format — `{"advisories": [...]}` with entries like:
+
+```json
+{"id": "CVE-2099-0001", "severity": "high", "match": "logsvc",
+ "summary": "logsvc RCE before 2.4.1", "affected_below": "2.4.1",
+ "fixed_version": "2.4.1", "recommendation": "Update logsvc to 2.4.1 or later."}
+```
+
+`match` is the cmdline substring identifying the product; `affected_below` gates the advisory to versions extracted from the cmdline that are lower than it (unparseable versions never claim "vulnerable"); omit it to match all versions. The feed is vendor-neutral — it covers any software a managed agent runs. `--advisory-check [CMDLINE]` prints the matching advisories as JSON and exits, for testing a feed entry against a cmdline.
+
 ### Optional: GLM machine-learning detector (`integrations.glm`)
 
 Set `integrations.glm.enabled: true` in Guardian.yaml to route the `machine_learning` detector through a [GLM model](https://open.bigmodel.cn/) (Zhipu AI, e.g. `glm-4.6`) via its OpenAI-compatible API:

@@ -18,6 +18,8 @@ from guardian import (
     Detection,
     SelfScaler,
     _glm_config,
+    advisory_scan,
+    advise_remediation,
     anomaly_scan,
     apply_update,
     assess_inaction_risk,
@@ -25,6 +27,7 @@ from guardian import (
     check_updates,
     detect_threats,
     glm_scan,
+    load_advisories,
     load_signatures,
     main,
     ml_scan,
@@ -33,6 +36,7 @@ from guardian import (
     signature_scan,
     terminate_agent,
     verify_signature,
+    version_below,
     sha256_of,
 )
 from guardian_audit import read_audit_trail
@@ -388,6 +392,254 @@ class TestSignaturesDB(unittest.TestCase):
     def test_falls_back_to_defaults(self):
         sigs = load_signatures(Path("/nonexistent.json"))
         self.assertIn("rm -rf /", sigs)
+
+
+ADVISORY_FEED = {
+    "advisories": [
+        {"id": "CVE-2099-0001", "severity": "high", "match": "logsvc",
+         "summary": "logsvc remote code execution before 2.4.1",
+         "affected_below": "2.4.1", "fixed_version": "2.4.1",
+         "recommendation": "Update logsvc to 2.4.1 or later."},
+        {"id": "CVE-2099-0002", "severity": "low", "match": "agent",
+         "summary": "agent framework info leak (all versions)",
+         "recommendation": "Restrict agent log output."},
+        {"id": "BAD-NO-MATCH", "severity": "high"},
+        {"severity": "high", "match": "x"},
+        {"id": "BAD-SEVERITY", "severity": "apocalyptic", "match": "y"},
+    ]
+}
+
+
+class TestAdvisoryFeed(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_feed(self, data=None):
+        feed = self.dir / "advisories.json"
+        feed.write_text(json.dumps(ADVISORY_FEED if data is None else data))
+        return feed
+
+    def test_loads_valid_feed(self):
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", self.dir / "audit.log"):
+            advisories = load_advisories(self.write_feed())
+        ids = [a["id"] for a in advisories]
+        self.assertEqual(ids, ["CVE-2099-0001", "CVE-2099-0002"])
+
+    def test_missing_feed_returns_empty_and_audits(self):
+        log = self.dir / "audit.log"
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", log):
+            self.assertEqual(load_advisories(self.dir / "nope.json"), [])
+        actions = [a["description"] for a in read_audit_trail(log, action_type="update")]
+        self.assertTrue(any("Advisory feed not found" in a for a in actions))
+
+    def test_invalid_json_feed_returns_empty_and_audits(self):
+        feed = self.dir / "advisories.json"
+        feed.write_text("{ not json")
+        log = self.dir / "audit.log"
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", log):
+            self.assertEqual(load_advisories(feed), [])
+        actions = [a["description"] for a in read_audit_trail(log, action_type="update")]
+        self.assertTrue(any("not valid JSON" in a for a in actions))
+
+    def test_min_severity_filters(self):
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", self.dir / "audit.log"):
+            advisories = load_advisories(self.write_feed(), min_severity="medium")
+        self.assertEqual([a["id"] for a in advisories], ["CVE-2099-0001"])
+
+    def test_malformed_entries_skipped(self):
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", self.dir / "audit.log"):
+            advisories = load_advisories(self.write_feed())
+        ids = [a["id"] for a in advisories]
+        self.assertNotIn("BAD-NO-MATCH", ids)
+        self.assertNotIn("BAD-SEVERITY", ids)
+
+
+class TestVersionBelow(unittest.TestCase):
+    def test_lower_versions(self):
+        self.assertTrue(version_below("2.3.0", "2.4.1"))
+        self.assertTrue(version_below("2.4.0", "2.4.1"))
+        self.assertTrue(version_below("1", "2"))
+
+    def test_equal_and_higher_not_below(self):
+        self.assertFalse(version_below("2.4.1", "2.4.1"))
+        self.assertFalse(version_below("2.4.2", "2.4.1"))
+        self.assertFalse(version_below("10.0", "2.4.1"))
+
+    def test_unparseable_never_claims_vulnerable(self):
+        self.assertFalse(version_below("", "2.4.1"))
+        self.assertFalse(version_below("latest", "2.4.1"))
+        self.assertFalse(version_below("2.3", ""))
+
+
+class TestAdvisoryScan(unittest.TestCase):
+    def advisories(self):
+        return [
+            {"id": "CVE-2099-0001", "severity": "high", "match": "logsvc",
+             "summary": "", "affected_below": "2.4.1", "fixed_version": "2.4.1",
+             "recommendation": "Update logsvc to 2.4.1 or later."},
+            {"id": "CVE-2099-0002", "severity": "low", "match": "agent",
+             "summary": "", "affected_below": "", "fixed_version": "",
+             "recommendation": "Restrict agent log output."},
+        ]
+
+    def test_vulnerable_version_matches(self):
+        proc = AgentProcess(pid=1, name="agent", cmdline="agent --plugin logsvc-2.3.0 --serve")
+        matches = advisory_scan(proc, self.advisories())
+        by_id = {m.advisory_id: m for m in matches}
+        self.assertIn("CVE-2099-0001", by_id)
+        self.assertEqual(by_id["CVE-2099-0001"].matched, "2.3.0")
+        self.assertEqual(by_id["CVE-2099-0001"].fixed_version, "2.4.1")
+
+    def test_patched_version_does_not_match(self):
+        proc = AgentProcess(pid=1, name="agent", cmdline="agent --plugin logsvc-2.4.1 --serve")
+        matches = advisory_scan(proc, self.advisories())
+        self.assertNotIn("CVE-2099-0001", {m.advisory_id for m in matches})
+
+    def test_match_without_version_gate_always_applies(self):
+        proc = AgentProcess(pid=1, name="agent", cmdline="python3 agent.py --serve")
+        matches = advisory_scan(proc, self.advisories())
+        self.assertIn("CVE-2099-0002", {m.advisory_id for m in matches})
+
+    def test_unrelated_process_does_not_match(self):
+        proc = AgentProcess(pid=1, name="helper", cmdline="helper --idle")
+        self.assertEqual(advisory_scan(proc, self.advisories()), [])
+
+    def test_unparseable_version_with_gate_does_not_match(self):
+        proc = AgentProcess(pid=1, name="agent", cmdline="agent --plugin logsvc --serve")
+        matches = advisory_scan(proc, self.advisories())
+        self.assertNotIn("CVE-2099-0001", {m.advisory_id for m in matches})
+
+
+class TestAdviseRemediation(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.advisories = [
+            guardian.RemediationAdvisory(
+                advisory_id="CVE-2099-0001", severity="high", product="logsvc",
+                matched="2.3.0", fixed_version="2.4.1",
+                recommendation="Update logsvc to 2.4.1 or later."),
+        ]
+        self.proc = AgentProcess(pid=77, name="agent",
+                                 cmdline="agent --plugin logsvc-2.3.0 --serve")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_advisory_alerts_and_audits(self):
+        log = self.dir / "audit.log"
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", log):
+            count = advise_remediation(self.proc, self.advisories, make_config(), set())
+        self.assertEqual(count, 1)
+        entries = read_audit_trail(log, action_type="escalation")
+        self.assertTrue(any("CVE-2099-0001" in e["description"] for e in entries))
+        self.assertTrue(any("2.4.1" in e["description"] for e in entries))
+        # advisory_only marker: the response never acts on the process itself
+        self.assertTrue(any(e["details"].get("action") == "advisory_only" for e in entries))
+        # advisories are not terminations
+        self.assertEqual(read_audit_trail(log, action_type="termination"), [])
+
+    def test_alert_on_advisory_false_still_audits(self):
+        log = self.dir / "audit.log"
+        config = make_config(remediation_advisory={"enabled": True, "alert_on_advisory": False})
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", log):
+            count = advise_remediation(self.proc, self.advisories, config, set())
+        self.assertEqual(count, 1)
+        alerts = [e for e in read_audit_trail(log, action_type="escalation")
+                  if e["description"].startswith("ALERT:")]
+        self.assertEqual(alerts, [])
+        self.assertTrue(any("CVE-2099-0001" in e["description"]
+                            for e in read_audit_trail(log, action_type="escalation")))
+
+    def test_dedup_per_pid_and_advisory(self):
+        advised: set = set()
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", self.dir / "audit.log"):
+            self.assertEqual(advise_remediation(self.proc, self.advisories, make_config(), advised), 1)
+            self.assertEqual(advise_remediation(self.proc, self.advisories, make_config(), advised), 0)
+
+    def test_no_match_is_silent(self):
+        log = self.dir / "audit.log"
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", log):
+            self.assertEqual(advise_remediation(self.proc, [], make_config(), set()), 0)
+        self.assertEqual(read_audit_trail(log), [])
+
+
+class TestAdvisoryRunCycle(unittest.TestCase):
+    def test_cycle_advises_vulnerable_process(self):
+        with tempfile.TemporaryDirectory() as d:
+            feed = Path(d) / "advisories.json"
+            feed.write_text(json.dumps({"advisories": [
+                {"id": "CVE-2099-0001", "severity": "high", "match": "logsvc",
+                 "affected_below": "2.4.1", "fixed_version": "2.4.1",
+                 "recommendation": "Update logsvc to 2.4.1 or later."},
+            ]}))
+            log = Path(d) / "audit.log"
+            proc = AgentProcess(pid=88, name="agent",
+                                cmdline="agent --plugin logsvc-2.3.0 --serve")
+            config = make_config(remediation_advisory={
+                "enabled": True, "advisory_feed": str(feed)})
+            with patch("guardian.AgentProcess.scan", return_value=[proc]):
+                run_cycle(config, [], dry_run=True, audit_log=log)
+            entries = [e for e in read_audit_trail(log, action_type="escalation")
+                       if e["description"].startswith("Remediation advisory CVE-2099-0001")]
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["risk_level"], "high")
+            # advisory must not trigger termination
+            self.assertEqual(read_audit_trail(log, action_type="termination"), [])
+
+    def test_cycle_skips_advisories_when_disabled(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "audit.log"
+            proc = AgentProcess(pid=88, name="agent",
+                                cmdline="agent --plugin logsvc-2.3.0 --serve")
+            config = make_config(remediation_advisory={"enabled": False})
+            with patch("guardian.AgentProcess.scan", return_value=[proc]):
+                run_cycle(config, [], dry_run=True, audit_log=log)
+            entries = [e for e in read_audit_trail(log, action_type="escalation")
+                       if "advisory" in e["description"].lower()]
+            self.assertEqual(entries, [])
+
+
+class TestAdvisoryCli(unittest.TestCase):
+    def test_advisory_check_prints_json_and_exits(self):
+        with tempfile.TemporaryDirectory() as d:
+            feed = Path(d) / "advisories.json"
+            feed.write_text(json.dumps({"advisories": [
+                {"id": "CVE-2099-0001", "severity": "high", "match": "logsvc",
+                 "affected_below": "2.4.1", "fixed_version": "2.4.1",
+                 "recommendation": "Update logsvc to 2.4.1 or later."},
+            ]}))
+            cfg = Path(d) / "cfg.yaml"
+            cfg.write_text(yaml.safe_dump({
+                "guardian_agent": {
+                    "enabled": True,
+                    "remediation_advisory": {"enabled": True,
+                                             "advisory_feed": str(feed)},
+                },
+            }))
+            out = io.StringIO()
+            with patch.object(guardian_audit, "AUDIT_LOG_PATH", Path(d) / "audit.log"), \
+                 patch("sys.stdout", out):
+                rc = main(["--config", str(cfg), "--advisory-check",
+                           "agent --plugin logsvc-2.3.0 --serve"])
+            self.assertEqual(rc, 0)
+            payload = json.loads(out.getvalue())
+            self.assertEqual(payload[0]["advisory_id"], "CVE-2099-0001")
+
+    def test_advisory_check_clean_cmdline_prints_empty_list(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d) / "cfg.yaml"
+            cfg.write_text(yaml.safe_dump({"guardian_agent": {"enabled": True}}))
+            out = io.StringIO()
+            with patch.object(guardian_audit, "AUDIT_LOG_PATH", Path(d) / "audit.log"), \
+                 patch("sys.stdout", out):
+                rc = main(["--config", str(cfg), "--advisory-check", "agent --serve"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out.getvalue()), [])
 
 
 class TestRunCycle(unittest.TestCase):
