@@ -410,6 +410,133 @@ class TestRunCycle(unittest.TestCase):
 
 
 
+class TestSelfScaling(unittest.TestCase):
+    """Guardian splits into as many workers as the threat load needs —
+    not always max_agents — bounded by threshold, cooldown, and the cap."""
+
+    def make_scaler(self, log: Path, **overrides):
+        section = {"enabled": True, "split_threshold": 3, "min_agents": 1,
+                   "max_agents": 8, "cooldown_cycles": 2}
+        section.update(overrides)
+        cfg = make_config(self_scaling=section)
+        import guardian
+        return guardian.SelfScaler(cfg)
+
+    def test_disabled_never_splits(self):
+        import guardian
+        scaler = guardian.SelfScaler(make_config())  # no self_scaling section
+        self.assertFalse(scaler.enabled())
+        with patch("guardian.subprocess.Popen") as popen:
+            self.assertEqual(scaler.maybe_split(99, scan_pattern="agent", dry_run=True), 0)
+            popen.assert_not_called()
+
+    def test_scales_to_threat_count_not_always_max(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "audit.log"
+            scaler = self.make_scaler(log)
+            child = MagicMock()
+            child.poll.return_value = None
+            with patch.object(guardian_audit, "AUDIT_LOG_PATH", log), \
+                 patch("guardian.subprocess.Popen", return_value=child) as popen:
+                # 4 threats => 4 guardians total: 1 parent + 3 workers (not 8)
+                spawned = scaler.maybe_split(4, scan_pattern="agent", dry_run=True)
+            self.assertEqual(spawned, 3)
+            self.assertEqual(popen.call_count, 3)
+            for call in popen.call_args_list:
+                cmd = call.args[0]
+                self.assertIn("--once", cmd)
+                self.assertIn("--dry-run", cmd)
+                self.assertIn("agent", cmd)
+            escalations = [e for e in read_audit_trail(log, action_type="escalation")
+                           if "Self-scaling" in e["description"]]
+            self.assertEqual(len(escalations), 1)
+            self.assertEqual(escalations[0]["details"]["threat_count"], 4)
+
+    def test_split_capped_at_max_agents(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "audit.log"
+            scaler = self.make_scaler(log, max_agents=5)
+            child = MagicMock()
+            child.poll.return_value = None
+            with patch.object(guardian_audit, "AUDIT_LOG_PATH", log), \
+                 patch("guardian.subprocess.Popen", return_value=child) as popen:
+                spawned = scaler.maybe_split(20, scan_pattern="agent", dry_run=True)
+            self.assertEqual(spawned, 4)  # 5 total: 1 parent + 4 workers
+            self.assertEqual(popen.call_count, 4)
+
+    def test_below_threshold_does_not_split(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "audit.log"
+            scaler = self.make_scaler(log, split_threshold=3)
+            with patch("guardian.subprocess.Popen") as popen:
+                self.assertEqual(scaler.maybe_split(2, scan_pattern="agent", dry_run=True), 0)
+                popen.assert_not_called()
+
+    def test_cooldown_blocks_immediate_resplit(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "audit.log"
+            scaler = self.make_scaler(log, cooldown_cycles=2)
+            child = MagicMock()
+            child.poll.return_value = None
+            with patch.object(guardian_audit, "AUDIT_LOG_PATH", log), \
+                 patch("guardian.subprocess.Popen", return_value=child) as popen:
+                self.assertEqual(scaler.maybe_split(4, scan_pattern="agent", dry_run=True), 3)
+                self.assertEqual(popen.call_count, 3)
+                popen.reset_mock()
+                for _ in range(2):  # cooldown cycles
+                    self.assertEqual(scaler.maybe_split(8, scan_pattern="agent", dry_run=True), 0)
+                    popen.assert_not_called()
+                # cooldown expired; 8 threats - (1 parent + 3 active workers) = 4 more
+                self.assertEqual(scaler.maybe_split(8, scan_pattern="agent", dry_run=True), 4)
+                self.assertEqual(popen.call_count, 4)
+
+    def test_dead_workers_are_not_counted(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "audit.log"
+            scaler = self.make_scaler(log, cooldown_cycles=0)
+            alive = MagicMock()
+            alive.poll.return_value = None
+            dead = MagicMock()
+            dead.poll.return_value = 0  # exited
+            with patch.object(guardian_audit, "AUDIT_LOG_PATH", log), \
+                 patch("guardian.subprocess.Popen", return_value=alive) as popen:
+                scaler.active_children = [dead]
+                spawned = scaler.maybe_split(3, scan_pattern="agent", dry_run=True)
+            self.assertEqual(spawned, 2)  # dead worker pruned: 3 total - 1 parent
+            self.assertEqual(len(scaler.active_children), 2)
+
+    def test_live_mode_split_omits_dry_run_flag(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "audit.log"
+            scaler = self.make_scaler(log)
+            child = MagicMock()
+            child.poll.return_value = None
+            with patch.object(guardian_audit, "AUDIT_LOG_PATH", log), \
+                 patch("guardian.subprocess.Popen", return_value=child) as popen:
+                scaler.maybe_split(3, scan_pattern="agent", dry_run=False)
+            cmd = popen.call_args.args[0]
+            self.assertNotIn("--dry-run", cmd)
+
+    def test_run_cycle_invokes_scaler_with_detection_count(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "audit.log"
+            import guardian
+            scaler = guardian.SelfScaler(make_config(self_scaling={
+                "enabled": True, "split_threshold": 1, "max_agents": 8,
+                "min_agents": 1, "cooldown_cycles": 2}))
+            child = MagicMock()
+            child.poll.return_value = None
+            with patch("guardian.AgentProcess.scan", return_value=[PROC_EVIL]), \
+                 patch("guardian.proc_kill"), \
+                 patch("guardian.subprocess.Popen", return_value=child) as popen:
+                run_cycle(make_config(self_scaling={
+                    "enabled": True, "split_threshold": 1, "max_agents": 8,
+                    "min_agents": 1, "cooldown_cycles": 2}),
+                    ["curl"], dry_run=True, audit_log=log, scaler=scaler)
+            popen.assert_called()  # detections occurred => split triggered
+
+
+
 class TestGLMIntegration(unittest.TestCase):
     """Tests for the GLM opt-in machine_learning detector."""
 

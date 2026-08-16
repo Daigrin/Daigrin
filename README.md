@@ -10,7 +10,18 @@ The agent configuration lives at [Guardian.yaml](Guardian.yaml). It defines:
 - **Guardian agent** (`guardian_agent`) — monitoring of system calls, network connections, and agent interactions; `threat_detection` via machine-learning, signature, anomaly, and behavioral algorithms; `risk_assessment` with `assess_inaction_risk` scoring the risk of *inaction* (low/medium/high/critical) and escalating at `high`; `agent_termination` with confirmation required and `auto_terminate_on_critical` bypassing it at critical risk; `system_protection` blocking sensitive resource access and preventing system changes.
 - **Updates** (`updates`) — `auto_update: true` makes [guardian.py](guardian.py) automatically sweep the `inbox` (`updates/inbox` by default) every `check_interval` (45m) while the monitor runs (and once per `--once` invocation; `--no-updates` opts out). Every candidate goes through the same authorization pipeline: `verify_signatures` requires a matching `<file>.sig` (unsigned or tampered updates are quarantined, never applied) and `rollback_on_failure` snapshots the previous version into `backups/` before staging; threat intelligence comes from centralized servers, cloud services, peer-to-peer networks, and local sources; delivered over HTTPS, SFTP, or SSH (ftp removed because it sends credentials in plaintext); as executables, scripts, configs, or database updates.
 
-The guardian implementation in [guardian.py](guardian.py) additionally honors optional `core_directives` (prime directive / safety policy), `adaptive_learning`, `self_scaling`, `integrations.norton`, and `integrations.glm` sections, which are off/absent in this config.
+The guardian implementation in [guardian.py](guardian.py) additionally honors optional `core_directives` (prime directive / safety policy) and `adaptive_learning` sections (off/absent in this config), plus `self_scaling` and `integrations.norton`/`integrations.glm`, documented below.
+
+### Self-scaling (`self_scaling`)
+
+When the threat load spikes, the guardian splits into extra worker processes — as many as it needs, not a fixed number. Each cycle the detections are counted; once they reach `split_threshold`, the guardian spawns workers until the total guardian count matches the detection count, so a small incident gets a small response and a large one scales out:
+
+- **`enabled`** — turn self-scaling on/off (default `false`; `true` in this config)
+- **`split_threshold`** — detections in one cycle that trigger a split (default `3`)
+- **`min_agents`** / **`max_agents`** — total guardian count is clamped to this range; `max_agents: 8` here means 1 supervisor plus up to 7 spawned workers, never more
+- **`cooldown_cycles`** — cycles to wait between splits so load bursts don't thrash
+
+Spawned workers run `guardian.py --once --pattern <pattern>` (plus `--dry-run` when the parent is in dry-run), and every split is written to the audit trail as an `escalation` entry with the threat count and active workers.
 
 ### Optional: GLM machine-learning detector (`integrations.glm`)
 
