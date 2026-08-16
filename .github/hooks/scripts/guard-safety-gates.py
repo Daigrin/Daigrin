@@ -8,6 +8,12 @@ PATH_FIELDS = ("filePath", "file", "path", "notebookPath", "targetFile")
 CONTENT_FIELDS = ("content", "contents", "text", "newContent", "new_content", "fileContents")
 OLD_FIELDS = ("old_string", "oldString", "oldText", "old_text")
 NEW_FIELDS = ("new_string", "newString", "newText", "new_text")
+REPLACEMENT_PAIRS = (
+    ("old_string", "new_string"),
+    ("oldString", "newString"),
+    ("oldText", "newText"),
+    ("old_text", "new_text"),
+)
 GUARDED = {"guardian.py", "guardian_audit.py"}
 REQUIRED_STRINGS = (
     "authorize_termination",
@@ -52,23 +58,20 @@ def target_path(data):
 def iter_replacements(data):
     """Yield (old, new) pairs from every recognized edit field, in order."""
     pairs = []
-    for old_field in OLD_FIELDS:
+    for old_field, new_field in REPLACEMENT_PAIRS:
         old_value = data.get(old_field)
-        if isinstance(old_value, str):
-            new_value = next(
-                (data.get(field) for field in NEW_FIELDS if isinstance(data.get(field), str)),
-                None,
-            )
-            if new_value is not None:
-                pairs.append((old_value, new_value))
+        new_value = data.get(new_field)
+        if isinstance(old_value, str) and isinstance(new_value, str):
+            pairs.append((old_value, new_value))
     edits = data.get("edits")
     if isinstance(edits, list):
         for edit in edits:
             if isinstance(edit, dict):
-                old_value = next((edit.get(field) for field in OLD_FIELDS if isinstance(edit.get(field), str)), None)
-                new_value = next((edit.get(field) for field in NEW_FIELDS if isinstance(edit.get(field), str)), None)
-                if old_value is not None and new_value is not None:
-                    pairs.append((old_value, new_value))
+                for old_field, new_field in REPLACEMENT_PAIRS:
+                    old_value = edit.get(old_field)
+                    new_value = edit.get(new_field)
+                    if isinstance(old_value, str) and isinstance(new_value, str):
+                        pairs.append((old_value, new_value))
     return pairs
 
 

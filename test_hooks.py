@@ -170,6 +170,46 @@ class TestGuardSafetyGates(HookAssertions):
         )
         self.assertDenied(result)
 
+    def test_denies_mixed_field_styles_where_old_code_would_mispair_and_miss_violation(self):
+        # old_string/new_string is a benign retain; oldText/newText removes a log_action call.
+        # With the old (broken) code, oldText was paired with new_string (harmless) so the
+        # log_action removal was never applied and the hook wrongly allowed the edit.
+        # With the fix, oldText is correctly paired with newText (empty) → denial.
+        fixture_guardian_file(self.dir)
+        result = self.run_safety(
+            {
+                "tool_input": {
+                    "path": "guardian.py",
+                    "old_string": "least_force_first = True",
+                    "new_string": "least_force_first = True  # retained",
+                    "oldText": '    log_action("detection", "call 3")\n',
+                    "newText": "",
+                }
+            }
+        )
+        self.assertDenied(result)
+
+    def test_denies_mixed_field_styles_in_edits_entry_where_mispair_would_miss_violation(self):
+        # An edits-list entry that contains both field styles must also pair correctly.
+        # old_string/new_string is benign; oldText/newText removes a log_action call.
+        fixture_guardian_file(self.dir)
+        result = self.run_safety(
+            {
+                "tool_input": {
+                    "path": "guardian.py",
+                    "edits": [
+                        {
+                            "old_string": "least_force_first = True",
+                            "new_string": "least_force_first = True  # retained",
+                            "oldText": '    log_action("detection", "call 3")\n',
+                            "newText": "",
+                        },
+                    ],
+                }
+            }
+        )
+        self.assertDenied(result)
+
     def test_denies_net_decrease_attack_that_readds_one_call_elsewhere(self):
         path = fixture_guardian_file(self.dir)
         proposed = path.read_text(encoding="utf-8")
@@ -207,6 +247,22 @@ class TestGuardSafetyGates(HookAssertions):
                 "tool_input": {
                     "query": "find guardian.py references to log_action(",
                     "command": "echo guardian.py log_action(",
+                }
+            }
+        )
+        self.assertAllowed(result)
+
+    def test_allows_mixed_field_styles_when_both_pairs_are_benign(self):
+        # Both old_string/new_string and oldText/newText retain log_action calls → allowed.
+        fixture_guardian_file(self.dir)
+        result = self.run_safety(
+            {
+                "tool_input": {
+                    "path": "guardian.py",
+                    "old_string": "least_force_first = True",
+                    "new_string": "least_force_first = True  # ok",
+                    "oldText": "verify_signatures = True",
+                    "newText": "verify_signatures = True  # ok",
                 }
             }
         )

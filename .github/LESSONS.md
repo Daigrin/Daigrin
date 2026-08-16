@@ -38,3 +38,8 @@ Cross-agent learning record for this repo's custom agents (Guardian Engineer, Gu
 - **Lesson**: Count-based safety hooks must reconstruct the full post-edit file across every recognized edit field; applying only the first replacement is a silent multi-edit bypass.
 - **Evidence**: Review of the safety-gates hook found that an innocent first edit plus a later malicious edit could remove `log_action()` coverage without changing the reconstructed proposal seen by the guard.
 - **Applied to**: .github/hooks/scripts/guard-safety-gates.py, test_hooks.py, .github/workflows/guardian.yml
+
+### 2026-08-16 — Copilot Coding Agent
+- **Lesson**: When scanning multiple old/new field styles (e.g. `old_string`/`new_string` AND `oldText`/`newText`), pair each old field only with its semantically matched new field. Picking the first available new-field value for every old field mis-reconstructs the post-edit file and reintroduces the bypass the hook is meant to close.
+- **Evidence**: `iter_replacements()` iterated OLD_FIELDS and used `next(NEW_FIELDS)` — a payload with both `old_string`/`new_string` (benign) and `oldText`/`newText` (drops log_action) caused `oldText` to be paired with `new_string`, so the log_action removal was never applied to the simulated file.
+- **Applied to**: .github/hooks/scripts/guard-safety-gates.py (REPLACEMENT_PAIRS constant), test_hooks.py (two new regression tests for top-level and edits-list mis-pair scenarios)
