@@ -19,6 +19,7 @@ from typing import Optional
 from unittest.mock import patch
 
 from guardian import AgentProcess, Config, run_cycle
+from guardian_audit import read_audit_trail
 
 from . import Outcome, Sample, Score, load_jsonl, score_samples
 
@@ -54,16 +55,16 @@ def evaluate_sample(sample: Sample, config: Config, signatures: list[str]) -> Ou
         with patch.object(AgentProcess, "scan", return_value=[proc]):
             acted = run_cycle(config, signatures, dry_run=True,
                               scan_pattern="agent", audit_log=audit_log)
-        entries = audit_log.read_text(encoding="utf-8").splitlines() if audit_log.exists() else []
+        detected = bool(read_audit_trail(audit_log, action_type="detection"))
     expected = sample.meta.get("expected_action") or (
         "flag" if sample.label == "malicious" else "ignore")
     if expected == "ignore":
-        flagged = acted > 0 or any('"action_type": "detection"' in e for e in entries)
+        flagged = acted > 0 or detected
         return Outcome(sample.sample_id, sample.label, flagged,
                        detail="falsely flagged" if flagged else "left alone")
     flagged = acted > 0
     detail = "escalated/acted" if flagged else (
-        "detected but not acted on" if entries else "no detection")
+        "detected but not acted on" if detected else "no detection")
     return Outcome(sample.sample_id, sample.label, flagged, detail=detail)
 
 
