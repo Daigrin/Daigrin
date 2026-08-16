@@ -108,6 +108,19 @@ updates:
     - config  # .xml, .json
     - database  # .sql
 
+integrations:
+  norton:  # existing integration (unchanged)
+    enabled: false  # enable to load Norton threat signatures
+
+  glm:
+    enabled: false  # set true to score cmdlines with a GLM model in the machine_learning detector
+    model: glm-4.6
+    endpoint: https://open.bigmodel.cn/api/paas/v4/chat/completions  # OpenAI-compatible
+    api_key_env: GLM_API_KEY  # env var name; never store a key in this file
+    timeout_seconds: 8
+    min_confidence: 0.8  # GLM score below this => not a detection
+    fallback_to_heuristic: true  # on API error/missing key, fall back to built-in ml_scan heuristic
+
 todos:
   - task: alert_on_high_inaction_risk
     description: Send an alert when risk_assessment escalates at high (below the auto-terminate threshold)
@@ -130,3 +143,6 @@ todos:
   - task: automatic_authorized_updates
     description: Wire updates.auto_update/check_interval so signed updates in the inbox are applied automatically
     status: done  # check_updates() in guardian.py sweeps updates/inbox through the signature-gated apply_update()
+  - task: integrate_glm_ml_detector
+    description: Integrate GLM model family as opt-in provider for the machine_learning threat detector
+    status: done  # _glm_config / glm_scan in guardian.py; integrations.glm config; --glm-test CLI flag
