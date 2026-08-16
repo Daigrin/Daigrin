@@ -10,11 +10,13 @@ from unittest.mock import MagicMock, patch
 
 import yaml
 
+import guardian
 import guardian_audit
 from guardian import (
     AgentProcess,
     Config,
     Detection,
+    SelfScaler,
     _glm_config,
     anomaly_scan,
     apply_update,
@@ -414,17 +416,15 @@ class TestSelfScaling(unittest.TestCase):
     """Guardian splits into as many workers as the threat load needs —
     not always max_agents — bounded by threshold, cooldown, and the cap."""
 
-    def make_scaler(self, log: Path, **overrides):
+    def make_scaler(self, log: Path, **overrides) -> SelfScaler:
         section = {"enabled": True, "split_threshold": 3, "min_agents": 1,
                    "max_agents": 8, "cooldown_cycles": 2}
         section.update(overrides)
         cfg = make_config(self_scaling=section)
-        import guardian
-        return guardian.SelfScaler(cfg)
+        return SelfScaler(cfg)
 
     def test_disabled_never_splits(self):
-        import guardian
-        scaler = guardian.SelfScaler(make_config())  # no self_scaling section
+        scaler = SelfScaler(make_config())  # no self_scaling section
         self.assertFalse(scaler.enabled())
         with patch("guardian.subprocess.Popen") as popen:
             self.assertEqual(scaler.maybe_split(99, scan_pattern="agent", dry_run=True), 0)
@@ -501,9 +501,12 @@ class TestSelfScaling(unittest.TestCase):
             with patch.object(guardian_audit, "AUDIT_LOG_PATH", log), \
                  patch("guardian.subprocess.Popen", return_value=alive) as popen:
                 scaler.active_children = [dead]
+                # maybe_split returns newly spawned workers; dead worker pruned first,
+                # so 3 threats => 3 total - 1 parent = 2 new workers
                 spawned = scaler.maybe_split(3, scan_pattern="agent", dry_run=True)
-            self.assertEqual(spawned, 2)  # dead worker pruned: 3 total - 1 parent
-            self.assertEqual(len(scaler.active_children), 2)
+            self.assertEqual(spawned, 2)
+            self.assertEqual(popen.call_count, 2)
+            self.assertEqual(scaler.active_children, [alive, alive])  # dead pruned
 
     def test_live_mode_split_omits_dry_run_flag(self):
         with tempfile.TemporaryDirectory() as d:
@@ -514,25 +517,23 @@ class TestSelfScaling(unittest.TestCase):
             with patch.object(guardian_audit, "AUDIT_LOG_PATH", log), \
                  patch("guardian.subprocess.Popen", return_value=child) as popen:
                 scaler.maybe_split(3, scan_pattern="agent", dry_run=False)
+            popen.assert_called()  # split triggers at threat_count == threshold
             cmd = popen.call_args.args[0]
             self.assertNotIn("--dry-run", cmd)
 
     def test_run_cycle_invokes_scaler_with_detection_count(self):
         with tempfile.TemporaryDirectory() as d:
             log = Path(d) / "audit.log"
-            import guardian
-            scaler = guardian.SelfScaler(make_config(self_scaling={
-                "enabled": True, "split_threshold": 1, "max_agents": 8,
-                "min_agents": 1, "cooldown_cycles": 2}))
+            scaling = {"enabled": True, "split_threshold": 1, "max_agents": 8,
+                       "min_agents": 1, "cooldown_cycles": 2}
+            scaler = SelfScaler(make_config(self_scaling=scaling))
             child = MagicMock()
             child.poll.return_value = None
             with patch("guardian.AgentProcess.scan", return_value=[PROC_EVIL]), \
                  patch("guardian.proc_kill"), \
                  patch("guardian.subprocess.Popen", return_value=child) as popen:
-                run_cycle(make_config(self_scaling={
-                    "enabled": True, "split_threshold": 1, "max_agents": 8,
-                    "min_agents": 1, "cooldown_cycles": 2}),
-                    ["curl"], dry_run=True, audit_log=log, scaler=scaler)
+                run_cycle(make_config(self_scaling=scaling),
+                          ["curl"], dry_run=True, audit_log=log, scaler=scaler)
             popen.assert_called()  # detections occurred => split triggered
 
 
