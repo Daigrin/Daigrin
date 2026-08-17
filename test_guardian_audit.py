@@ -54,6 +54,27 @@ class TestAuditLogging(unittest.TestCase):
         self.assertEqual(len(read_audit_trail(self.log_path, risk_level="critical")), 1)
         self.assertEqual(len(read_audit_trail(self.log_path, action_type="update")), 1)
 
+    def test_filters_combine_action_type_and_risk(self):
+        """Both filters apply together (AND), not either/or."""
+        log_action("detection", "d1", risk_level="low", log_path=self.log_path)
+        log_action("detection", "d2", risk_level="critical", log_path=self.log_path)
+        log_action("update", "u1", risk_level="critical", log_path=self.log_path)
+
+        hits = read_audit_trail(self.log_path, action_type="detection", risk_level="critical")
+        self.assertEqual([e["description"] for e in hits], ["d2"])
+
+    def test_malformed_line_does_not_hide_the_trail(self):
+        """One corrupt line (crash mid-write, truncated disk) must not make
+        the whole audit trail unreadable."""
+        log_action("detection", "good entry", log_path=self.log_path)
+        with self.log_path.open("a", encoding="utf-8") as f:
+            f.write("{ corrupt partial json")
+        log_action("termination", "also good", log_path=self.log_path)
+
+        entries = read_audit_trail(self.log_path)
+        self.assertEqual([e["description"] for e in entries],
+                         ["good entry", "also good"])
+
     def test_missing_log_returns_empty(self):
         self.assertEqual(read_audit_trail(Path(self.tmp.name) / "nope.log"), [])
 

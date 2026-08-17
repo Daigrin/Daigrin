@@ -67,7 +67,14 @@ def read_audit_trail(
     """Read the audit trail, optionally filtering by action type or risk."""
     if not log_path.exists():
         return []
-    entries = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    entries = []
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue  # corrupt line (crash mid-write); never hide the rest of the trail
     if action_type is not None:
         entries = [e for e in entries if e["action_type"] == action_type]
     if risk_level is not None:
