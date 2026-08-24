@@ -754,6 +754,13 @@ def _advisory_config(config: Config) -> dict[str, Any]:
     return section if isinstance(section, dict) else {}
 
 
+# run_cycle() calls load_advisories() every scan cycle, so parsed feeds are
+# memoized on (path, min_severity) and re-read only when the file's mtime
+# changes. Missing feeds cache as empty too: the audit entry is written once
+# per actual (re)load attempt, not once per cycle.
+_ADVISORY_FEED_CACHE: dict[tuple[str, str], tuple[int, list[dict[str, Any]]]] = {}
+
+
 def load_advisories(feed_path: Path, *, min_severity: str = "low") -> list[dict[str, Any]]:
     """Load the vendor-neutral advisory DB; invalid data degrades to none.
 
@@ -761,7 +768,25 @@ def load_advisories(feed_path: Path, *, min_severity: str = "low") -> list[dict[
     Entries missing id/match or with an unknown severity are skipped. A
     missing or unparseable feed is an audit-logged non-event, never an error —
     advisories must never degrade the monitoring mission.
+
+    Results are cached and reloaded only when the feed file's mtime changes,
+    so the per-cycle call in run_cycle() costs one stat() instead of a full
+    read + parse + audit entry.
     """
+    key = (str(feed_path), min_severity)
+    try:
+        mtime_ns = feed_path.stat().st_mtime_ns
+    except OSError:
+        mtime_ns = -1  # missing/unreadable: cached as the empty feed
+    cached = _ADVISORY_FEED_CACHE.get(key)
+    if cached is not None and cached[0] == mtime_ns:
+        return list(cached[1])
+    advisories = _parse_advisories(feed_path, min_severity=min_severity)
+    _ADVISORY_FEED_CACHE[key] = (mtime_ns, advisories)
+    return list(advisories)
+
+
+def _parse_advisories(feed_path: Path, *, min_severity: str) -> list[dict[str, Any]]:
     if not feed_path.exists():
         log_action("update", "Advisory feed not found",
                    details={"path": str(feed_path)})
