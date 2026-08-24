@@ -209,12 +209,14 @@ class AgentProcess:
         except (subprocess.SubprocessError, FileNotFoundError):
             return []
         procs = []
+        pattern_l = pattern.lower()
         for line in out.splitlines()[1:]:
             parts = line.split(None, 2)
             if len(parts) < 3:
                 continue
             pid_s, name, cmdline = parts
-            if pattern.lower() in cmdline.lower() and "guardian" not in cmdline.lower():
+            cmdline_l = cmdline.lower()
+            if pattern_l in cmdline_l and "guardian" not in cmdline_l:
                 try:
                     procs.append(cls(pid=int(pid_s), name=name, cmdline=cmdline))
                 except ValueError:
