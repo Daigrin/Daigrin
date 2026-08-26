@@ -28,7 +28,7 @@ Spawns run `guardian.py --once --pattern <pattern>` (plus `--dry-run` when the p
 Guardian doesn't just spot weak areas and log them — it tells the operator how to close them. When a managed agent's cmdline matches a known-vulnerable product/version in the advisory feed, Guardian sends an operator alert and writes an `escalation` audit entry with the advisory ID, severity, affected version, and recommended fix. Advisory-only by design: matches never feed termination and never modify the affected software (least force first — Guardian advises, the operator patches).
 
 - **`enabled`** — turn the advisory scan on/off (default `false`; `true` in this config)
-- **`advisory_feed`** — path to the vendor-neutral advisory DB (default `advisories.json`). Missing or invalid JSON degrades to zero advisories with an audit entry, never an error
+- **`advisory_feed`** — path to the vendor-neutral advisory DB (default `advisories.json`). Missing or invalid JSON degrades to zero advisories with an audit entry, never an error. The feed is parsed once and reloaded only when the file changes (mtime), so the per-scan-cycle check is a single `stat()`
 - **`min_severity`** — ignore advisories below this severity (`low`/`medium`/`high`/`critical`; default `low`)
 - **`alert_on_advisory`** — send an operator alert per match (default `true`); the audit entry is written either way
 

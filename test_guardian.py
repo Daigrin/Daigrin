@@ -457,6 +457,27 @@ class TestAdvisoryFeed(unittest.TestCase):
         self.assertNotIn("BAD-NO-MATCH", ids)
         self.assertNotIn("BAD-SEVERITY", ids)
 
+    def test_feed_cached_until_file_changes(self):
+        feed = self.write_feed()
+        log = self.dir / "audit.log"
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", log):
+            first = load_advisories(feed)
+            second = load_advisories(feed)
+        self.assertEqual([a["id"] for a in first], [a["id"] for a in second])
+        loads = [a for a in read_audit_trail(log, action_type="update")
+                 if "Loaded advisories" in a["description"]]
+        self.assertEqual(len(loads), 1)  # second call served from cache
+
+        # A new mtime triggers exactly one reload.
+        st = feed.stat()
+        os.utime(feed, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+        with patch.object(guardian_audit, "AUDIT_LOG_PATH", log):
+            third = load_advisories(feed)
+        self.assertEqual([a["id"] for a in third], [a["id"] for a in first])
+        loads = [a for a in read_audit_trail(log, action_type="update")
+                 if "Loaded advisories" in a["description"]]
+        self.assertEqual(len(loads), 2)
+
 
 class TestVersionBelow(unittest.TestCase):
     def test_lower_versions(self):
