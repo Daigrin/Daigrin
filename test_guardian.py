@@ -913,7 +913,7 @@ class TestGLMIntegration(unittest.TestCase):
         self.assertEqual(result.algorithm, "machine_learning")
         self.assertIn("downloads and executes remote script", result.description)
         self.assertEqual(result.base_risk, "medium")
-        # Request must include the ******
+        # Request must include the Authorization Bearer header
         self.assertTrue(len(captured_request) == 1)
         auth = captured_request[0].get_header("Authorization")
         self.assertIsNotNone(auth)
