@@ -922,7 +922,8 @@ def detect_threats(proc: AgentProcess, config: Config, signatures: list[str]) ->
         if detector is None:
             continue
         if algo == "machine_learning":
-            result = glm_scan(proc, _glm_config(config))
+            glm_cfg = _glm_config(config)
+            result = glm_scan(proc, glm_cfg) if glm_cfg.get("enabled") else ml_scan(proc)
         elif detector is signature_scan:
             result = detector(proc, signatures)
         else:
