@@ -1042,8 +1042,11 @@ def apply_update(file_path: Path, config: Config, *, dry_run: bool = False) -> b
             target = quarantine_dir / file_path.name
             if not dry_run and file_path.exists():
                 file_path.replace(target)
-            log_action("update", f"Rejected unsigned update, quarantined: {file_path.name}",
-                       details={"quarantined_to": str(target)})
+            log_action(
+                "update",
+                f"Rejected update due to signature verification failure, quarantined: {file_path.name}",
+                details={"quarantined_to": str(target)},
+            )
             return False
     backup: Optional[Path] = None
     if upd.get("rollback_on_failure", False) and file_path.exists() and not dry_run:
